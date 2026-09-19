@@ -19,52 +19,17 @@ export const MAX_DETOUR_MILES    = 10;    // never suggest a detour longer than 
 export const MAX_STATIONS_SHOWN  = 6;     // top N ranked stations in the sidebar
 
 // Map tile styles — 100% free, no key, no account, no CC
-export const MAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/bright';
+export const MAP_STYLE_URL = 'https://tiles.openfreemap.org/styles/liberty';
 
 export const AVAILABLE_MAP_STYLES = [
   {
-    id: 'bright',
-    label: 'Detailed Streets',
-    icon: '🗺️',
-    url: 'https://tiles.openfreemap.org/styles/bright',
-  },
-  {
     id: 'liberty',
-    label: 'Liberty Classic',
-    icon: '🛣️',
+    label: 'Streets',
     url: 'https://tiles.openfreemap.org/styles/liberty',
   },
   {
-    id: 'topo',
-    label: 'Topographic & Terrain',
-    icon: '⛰️',
-    url: {
-      version: 8,
-      sources: {
-        'esri-topo': {
-          type: 'raster',
-          tiles: [
-            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
-          ],
-          tileSize: 256,
-          attribution: 'Esri, USGS',
-        },
-      },
-      layers: [
-        {
-          id: 'esri-topo-layer',
-          type: 'raster',
-          source: 'esri-topo',
-          minzoom: 0,
-          maxzoom: 19,
-        },
-      ],
-    },
-  },
-  {
     id: 'satellite',
-    label: 'Satellite Hybrid',
-    icon: '🛰️',
+    label: 'Satellite',
     url: {
       version: 8,
       sources: {

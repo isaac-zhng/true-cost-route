@@ -4,7 +4,7 @@
  * Visual language: clean white cards, 8px spacing grid, minimal color (one blue
  * accent), proper typographic hierarchy, no emoji in UI labels.
  */
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -16,7 +16,7 @@ import {
   Platform,
 } from 'react-native';
 
-import { geocode, getRoute, getStationsAlongRoute } from '../lib/routing';
+import { geocode, getRoute, getStationsAlongRoute, fetchAddressSuggestions, type AddressSuggestion } from '../lib/routing';
 import { assignPrices }                             from '../lib/gasApi';
 import { rankStations }                             from '../lib/optimizer';
 import type { TripInputs, RankedStation }           from '../lib/optimizer';
@@ -53,6 +53,8 @@ interface SearchPanelProps {
   selectedStation:  RankedStation | null;
   stations:         RankedStation[];
   onOpenCalculator: () => void;
+  userLat?:         number | null;
+  userLng?:         number | null;
 }
 
 const STAGE_LABEL: Record<Stage, string> = {
@@ -79,6 +81,7 @@ function StationCard({
 }) {
   const isBest  = rank === 0 && station.isWorthIt;
   const isWorth = station.isWorthIt;
+  const absNet  = Math.abs(station.netSavings).toFixed(2);
 
   return (
     <TouchableOpacity
@@ -92,7 +95,7 @@ function StationCard({
     >
       {isBest && (
         <View style={styles.bestBadge}>
-          <Text style={styles.bestBadgeText}>Best stop</Text>
+          <Text style={styles.bestBadgeText}>RECOMMENDED STOP (LOWEST TRUE COST)</Text>
         </View>
       )}
 
@@ -101,8 +104,13 @@ function StationCard({
         <View style={{ flex: 1 }}>
           <Text style={styles.cardName} numberOfLines={1}>{station.name}</Text>
           <Text style={styles.cardMeta}>
-            +{station.detourMiles.toFixed(1)} mi · +{Math.round(station.detourMinutes)} min
+            +{station.detourMiles.toFixed(1)} mi · +{Math.round(station.detourMinutes)} min detour
           </Text>
+          {isSelected && (
+            <Text style={{ fontSize: 11, color: T.blue, fontWeight: '600', marginTop: 3 }}>
+              Projected route on map
+            </Text>
+          )}
         </View>
 
         {/* Right: price + savings */}
@@ -113,11 +121,60 @@ function StationCard({
             { backgroundColor: isWorth ? T.greenBg : T.redBg },
           ]}>
             <Text style={[styles.savingsPillText, { color: isWorth ? T.green : T.red }]}>
-              {fmtSavings(station.netSavings)}
+              {isWorth ? `Save $${absNet}` : `Lose $${absNet}`}
+            </Text>
+          </View>
+          <Text style={styles.savingsSubtext}>
+            {isWorth ? 'net in pocket' : 'detour costs extra'}
+          </Text>
+        </View>
+      </View>
+
+      {/* Expanded True Cost breakdown when selected */}
+      {isSelected && (
+        <View style={styles.cardBreakdown}>
+          <View style={styles.breakdownHeader}>
+            <Text style={styles.breakdownTitle}>TRUE COST BREAKDOWN</Text>
+            <Text style={styles.breakdownSubtitle}>Price + Distance + Time calculation</Text>
+          </View>
+
+          <View style={styles.breakdownRow}>
+            <Text style={styles.breakdownLabel}>Pump discount (cheaper gas)</Text>
+            <Text style={[styles.breakdownVal, { color: T.green }]}>
+              +${Math.abs(station.grossSavingsVsLocal).toFixed(2)}
+            </Text>
+          </View>
+
+          <View style={styles.breakdownRow}>
+            <Text style={styles.breakdownLabel}>
+              Fuel burned (+{station.detourMiles.toFixed(1)} mi)
+            </Text>
+            <Text style={[styles.breakdownVal, { color: T.red }]}>
+              −${station.fuelWastedCost.toFixed(2)}
+            </Text>
+          </View>
+
+          <View style={styles.breakdownRow}>
+            <Text style={styles.breakdownLabel}>
+              Time value (+{Math.round(station.detourMinutes)} min)
+            </Text>
+            <Text style={[styles.breakdownVal, { color: T.red }]}>
+              −${station.timeCost.toFixed(2)}
+            </Text>
+          </View>
+
+          <View style={styles.breakdownDivider} />
+
+          <View style={styles.breakdownRow}>
+            <Text style={[styles.breakdownLabel, { fontWeight: '700', color: T.text1 }]}>
+              {isWorth ? 'Net in your pocket:' : 'Net detour loss:'}
+            </Text>
+            <Text style={[styles.breakdownVal, { fontWeight: '800', fontSize: 14, color: isWorth ? T.green : T.red }]}>
+              {isWorth ? `Save $${absNet}` : `Lose $${absNet}`}
             </Text>
           </View>
         </View>
-      </View>
+      )}
     </TouchableOpacity>
   );
 }
@@ -151,9 +208,20 @@ export default function SearchPanel({
   selectedStation,
   stations,
   onOpenCalculator,
+  userLat = null,
+  userLng = null,
 }: SearchPanelProps) {
-  const [origin,      setOrigin]      = useState('');
-  const [destination, setDestination] = useState('');
+  const [origin,            setOrigin]            = useState('');
+  const [destination,       setDestination]       = useState('');
+  const [originCoords,      setOriginCoords]      = useState<LngLat | null>(null);
+  const [destinationCoords, setDestinationCoords] = useState<LngLat | null>(null);
+
+  // Suggestions state
+  const [activeField,       setActiveField]       = useState<'origin' | 'destination' | null>(null);
+  const [suggestions,       setSuggestions]       = useState<AddressSuggestion[]>([]);
+  const [isSuggesting,      setIsSuggesting]      = useState(false);
+  const debounceTimerRef                          = useRef<any>(null);
+
   const [mpg,         setMpg]         = useState('25');
   const [gallons,     setGallons]     = useState('12');
   const [hourlyValue, setHourlyValue] = useState('25');
@@ -163,16 +231,78 @@ export default function SearchPanel({
   const isLoading = stage !== 'idle' && stage !== 'done' && stage !== 'error';
   const isDone    = stage === 'done';
 
+  // ── Debounced address suggestions fetch ──
+  const fetchDebounced = useCallback((text: string, field: 'origin' | 'destination') => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+
+    if (text.trim().length < 2) {
+      setSuggestions([]);
+      setIsSuggesting(false);
+      return;
+    }
+
+    setIsSuggesting(true);
+    debounceTimerRef.current = setTimeout(async () => {
+      // If destination, bias to originCoords if available, otherwise user location
+      const biasLat = field === 'destination' && originCoords ? originCoords.lat : (userLat ?? undefined);
+      const biasLng = field === 'destination' && originCoords ? originCoords.lng : (userLng ?? undefined);
+
+      const res = await fetchAddressSuggestions(text, biasLat, biasLng);
+      setSuggestions(res);
+      setIsSuggesting(false);
+    }, 260);
+  }, [originCoords, userLat, userLng]);
+
+  const handleOriginChange = (text: string) => {
+    setOrigin(text);
+    setOriginCoords(null);
+    setActiveField('origin');
+    fetchDebounced(text, 'origin');
+  };
+
+  const handleDestinationChange = (text: string) => {
+    setDestination(text);
+    setDestinationCoords(null);
+    setActiveField('destination');
+    fetchDebounced(text, 'destination');
+  };
+
+  const handleSelectSuggestion = (s: AddressSuggestion) => {
+    if (activeField === 'origin') {
+      setOrigin(s.fullText);
+      setOriginCoords(s.coords);
+    } else if (activeField === 'destination') {
+      setDestination(s.fullText);
+      setDestinationCoords(s.coords);
+    }
+    setSuggestions([]);
+    setActiveField(null);
+  };
+
+  const handleUseCurrentLocation = () => {
+    if (userLat === null || userLng === null) return;
+    setOrigin('Your current location');
+    setOriginCoords({ lat: userLat, lng: userLng });
+    setSuggestions([]);
+    setActiveField(null);
+  };
+
   const handleSearch = useCallback(async () => {
     if (!origin.trim() || !destination.trim()) {
       setErrorMsg('Enter both an origin and a destination to continue.');
       setStage('error');
       return;
     }
+    setSuggestions([]);
+    setActiveField(null);
     setErrorMsg('');
     setStage('geocoding');
     try {
-      const [o, d] = await Promise.all([geocode(origin), geocode(destination)]);
+      // Use pre-resolved coordinates from suggestion selection if available
+      const [o, d] = await Promise.all([
+        originCoords ? Promise.resolve(originCoords) : geocode(origin),
+        destinationCoords ? Promise.resolve(destinationCoords) : geocode(destination),
+      ]);
       if (!o) throw new Error(`Could not find "${origin}"`);
       if (!d) throw new Error(`Could not find "${destination}"`);
 
@@ -200,7 +330,7 @@ export default function SearchPanel({
       setErrorMsg(err instanceof Error ? err.message : 'An unexpected error occurred.');
       setStage('error');
     }
-  }, [origin, destination, mpg, gallons, hourlyValue, onRouteFound, onStationsFound]);
+  }, [origin, destination, originCoords, destinationCoords, mpg, gallons, hourlyValue, onRouteFound, onStationsFound]);
 
   return (
     <View style={styles.panel}>
@@ -225,11 +355,12 @@ export default function SearchPanel({
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
+        onScrollBeginDrag={() => setActiveField(null)}
       >
 
         {/* ── Route search ── */}
         <View style={styles.routeCard}>
-          {/* Origin */}
+          {/* Origin input row */}
           <View style={styles.routeRow}>
             <View style={styles.routeDotWrap}>
               <View style={[styles.routeDot, { backgroundColor: '#34A853' }]} />
@@ -239,18 +370,88 @@ export default function SearchPanel({
               placeholder="Starting point"
               placeholderTextColor={T.text3}
               value={origin}
-              onChangeText={setOrigin}
+              onChangeText={handleOriginChange}
+              onFocus={() => {
+                setActiveField('origin');
+                if (origin.trim().length >= 2) fetchDebounced(origin, 'origin');
+              }}
               returnKeyType="next"
               editable={!isLoading}
             />
+            {origin.length > 0 && (
+              <TouchableOpacity
+                onPress={() => {
+                  setOrigin('');
+                  setOriginCoords(null);
+                  setSuggestions([]);
+                }}
+                style={styles.clearBtn}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text style={styles.clearBtnText}>×</Text>
+              </TouchableOpacity>
+            )}
           </View>
+
+          {/* Origin suggestions dropdown */}
+          {activeField === 'origin' && (
+            <View style={styles.dropdown}>
+              {userLat !== null && userLng !== null && (
+                <TouchableOpacity
+                  style={styles.dropdownItem}
+                  onPress={handleUseCurrentLocation}
+                  activeOpacity={0.7}
+                >
+                  <View style={[styles.dropdownIconWrap, { backgroundColor: T.blueBg }]}>
+                    <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: T.blue }} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.dropdownPrimary, { color: T.blue }]}>Your current location</Text>
+                    <Text style={styles.dropdownSecondary}>Use GPS coordinates</Text>
+                  </View>
+                </TouchableOpacity>
+              )}
+
+              {isSuggesting && (
+                <View style={styles.dropdownLoading}>
+                  <ActivityIndicator size="small" color={T.blue} />
+                  <Text style={styles.dropdownLoadingText}>Finding nearby addresses…</Text>
+                </View>
+              )}
+
+              {suggestions.map(s => (
+                <TouchableOpacity
+                  key={s.id}
+                  style={styles.dropdownItem}
+                  onPress={() => handleSelectSuggestion(s)}
+                  activeOpacity={0.7}
+                >
+                  <View style={styles.dropdownIconWrap}>
+                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: T.text3 }} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.dropdownPrimary} numberOfLines={1}>{s.primaryText}</Text>
+                    {!!s.secondaryText && (
+                      <Text style={styles.dropdownSecondary} numberOfLines={1}>{s.secondaryText}</Text>
+                    )}
+                  </View>
+                </TouchableOpacity>
+              ))}
+
+              {!isSuggesting && suggestions.length === 0 && origin.trim().length >= 2 && (
+                <View style={styles.dropdownEmpty}>
+                  <Text style={styles.dropdownEmptyText}>No matching locations found</Text>
+                </View>
+              )}
+            </View>
+          )}
 
           {/* Connecting line */}
           <View style={styles.routeConnector}>
             <View style={styles.connectorLine} />
           </View>
 
-          {/* Destination */}
+          {/* Destination input row */}
           <View style={styles.routeRow}>
             <View style={styles.routeDotWrap}>
               <View style={[styles.routeDot, { backgroundColor: '#EA4335', borderRadius: 3 }]} />
@@ -260,12 +461,66 @@ export default function SearchPanel({
               placeholder="Destination"
               placeholderTextColor={T.text3}
               value={destination}
-              onChangeText={setDestination}
+              onChangeText={handleDestinationChange}
+              onFocus={() => {
+                setActiveField('destination');
+                if (destination.trim().length >= 2) fetchDebounced(destination, 'destination');
+              }}
               returnKeyType="search"
               onSubmitEditing={handleSearch}
               editable={!isLoading}
             />
+            {destination.length > 0 && (
+              <TouchableOpacity
+                onPress={() => {
+                  setDestination('');
+                  setDestinationCoords(null);
+                  setSuggestions([]);
+                }}
+                style={styles.clearBtn}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Text style={styles.clearBtnText}>×</Text>
+              </TouchableOpacity>
+            )}
           </View>
+
+          {/* Destination suggestions dropdown */}
+          {activeField === 'destination' && (
+            <View style={styles.dropdown}>
+              {isSuggesting && (
+                <View style={styles.dropdownLoading}>
+                  <ActivityIndicator size="small" color={T.blue} />
+                  <Text style={styles.dropdownLoadingText}>Finding nearby addresses…</Text>
+                </View>
+              )}
+
+              {suggestions.map(s => (
+                <TouchableOpacity
+                  key={s.id}
+                  style={styles.dropdownItem}
+                  onPress={() => handleSelectSuggestion(s)}
+                  activeOpacity={0.7}
+                >
+                  <View style={styles.dropdownIconWrap}>
+                    <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: T.text3 }} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.dropdownPrimary} numberOfLines={1}>{s.primaryText}</Text>
+                    {!!s.secondaryText && (
+                      <Text style={styles.dropdownSecondary} numberOfLines={1}>{s.secondaryText}</Text>
+                    )}
+                  </View>
+                </TouchableOpacity>
+              ))}
+
+              {!isSuggesting && suggestions.length === 0 && destination.trim().length >= 2 && (
+                <View style={styles.dropdownEmpty}>
+                  <Text style={styles.dropdownEmptyText}>No matching locations found</Text>
+                </View>
+              )}
+            </View>
+          )}
         </View>
 
         {/* ── Vehicle params ── */}
@@ -304,11 +559,36 @@ export default function SearchPanel({
         {/* ── Results ── */}
         {isDone && stations.length > 0 && (
           <View style={styles.results}>
+            {/* Guide Explainer Banner */}
+            <View style={styles.guideBanner}>
+              <View style={styles.guideHeader}>
+                <Text style={styles.guideTitle}>How True Cost Ranking Works</Text>
+              </View>
+              <Text style={styles.guideText}>
+                We calculate if a gas detour is truly worth it by balancing{' '}
+                <Text style={{ fontWeight: '700' }}>Gas Price</Text>,{' '}
+                <Text style={{ fontWeight: '700' }}>Detour Distance</Text>, and{' '}
+                <Text style={{ fontWeight: '700' }}>Your Time</Text>:
+              </Text>
+              <View style={styles.guidePillsRow}>
+                <View style={[styles.guidePill, { backgroundColor: T.greenBg }]}>
+                  <Text style={[styles.guidePillText, { color: T.green }]}>
+                    Save: Real profit in your pocket
+                  </Text>
+                </View>
+                <View style={[styles.guidePill, { backgroundColor: T.redBg }]}>
+                  <Text style={[styles.guidePillText, { color: T.red }]}>
+                    Lose: Detour costs more than gas savings
+                  </Text>
+                </View>
+              </View>
+            </View>
+
             <Text style={styles.resultsHeader}>
-              {stations.length} stations along route
+              {stations.length} stations ranked along route
             </Text>
             <Text style={styles.resultsHint}>
-              Tap a card or map pin for full breakdown
+              Tap any station to project its route and view full cost breakdown
             </Text>
 
             {stations.map((s, i) => (
@@ -587,6 +867,93 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
+  savingsSubtext: {
+    fontSize: 10,
+    color: T.text3,
+    marginTop: 2,
+    textAlign: 'right',
+  },
+
+  // Card breakdown
+  cardBreakdown: {
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: '#F1F3F4',
+  },
+  breakdownHeader: {
+    marginBottom: 6,
+  },
+  breakdownTitle: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: T.text2,
+    letterSpacing: 0.5,
+  },
+  breakdownSubtitle: {
+    fontSize: 10,
+    color: T.text3,
+    marginTop: 1,
+  },
+  breakdownRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginVertical: 2,
+  },
+  breakdownLabel: {
+    fontSize: 12,
+    color: T.text2,
+  },
+  breakdownVal: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  breakdownDivider: {
+    height: 1,
+    backgroundColor: '#E8EAED',
+    marginVertical: 6,
+  },
+
+  // Guide explainer banner
+  guideBanner: {
+    backgroundColor: '#F8F9FA',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  guideHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 4,
+  },
+  guideTitle: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: T.text1,
+  },
+  guideText: {
+    fontSize: 11,
+    color: T.text2,
+    lineHeight: 16,
+    marginBottom: 8,
+  },
+  guidePillsRow: {
+    flexDirection: 'row',
+    gap: 6,
+    flexWrap: 'wrap',
+  },
+  guidePill: {
+    borderRadius: 6,
+    paddingVertical: 4,
+    paddingHorizontal: 8,
+  },
+  guidePillText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
 
   emptyText: {
     fontSize: 13,
@@ -594,5 +961,75 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     paddingVertical: 24,
     lineHeight: 20,
+  },
+
+  // Clear button in route input
+  clearBtn: {
+    padding: 4,
+    marginLeft: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  clearBtnText: {
+    fontSize: 12,
+    color: T.text3,
+    fontWeight: '600',
+  },
+
+  // Address suggestions dropdown
+  dropdown: {
+    backgroundColor: T.white,
+    borderTopWidth: 1,
+    borderTopColor: T.border,
+    maxHeight: 220,
+    overflow: 'hidden',
+  },
+  dropdownItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#F1F3F4',
+  },
+  dropdownIconWrap: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: T.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+    flexShrink: 0,
+  },
+  dropdownPrimary: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: T.text1,
+  },
+  dropdownSecondary: {
+    fontSize: 11,
+    color: T.text3,
+    marginTop: 1,
+  },
+  dropdownLoading: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    gap: 8,
+  },
+  dropdownLoadingText: {
+    fontSize: 12,
+    color: T.text3,
+  },
+  dropdownEmpty: {
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+  },
+  dropdownEmptyText: {
+    fontSize: 12,
+    color: T.text3,
+    fontStyle: 'italic',
   },
 });

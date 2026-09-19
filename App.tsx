@@ -144,7 +144,6 @@ function VerdictCard({ netSavings }: { netSavings: number }) {
   return (
     <View style={[styles.verdictCard, { borderColor: color, backgroundColor: dimBg }]}>
       <View style={[styles.verdictGlow, { backgroundColor: color }]} />
-      <Text style={[styles.verdictIcon, { color }]}>{isWorth ? '✓' : '✕'}</Text>
       <Text style={[styles.verdictTitle, { color }]}>{isWorth ? 'WORTH THE DETOUR' : 'SKIP THE DETOUR'}</Text>
       <Text style={styles.verdictAmount}>
         {netSavings >= 0 ? '+' : ''}{fmt(netSavings, 2)}
@@ -178,7 +177,6 @@ function HomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
     <View style={styles.homeRoot}>
       <StatusBar style="light" />
       <ScrollView contentContainerStyle={styles.homeContent}>
-        <Text style={styles.homeLogo}>⛽</Text>
         <Text style={styles.homeTitle}>True Cost Commute</Text>
         <Text style={styles.homeSub}>
           Stop guessing. Know exactly when a cheaper gas station is actually worth the detour.
@@ -189,7 +187,7 @@ function HomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
           onPress={() => onNavigate('map')}
           activeOpacity={0.85}
         >
-          <Text style={styles.homeBtnTitle}>🗺  Route Optimizer</Text>
+          <Text style={styles.homeBtnTitle}>Route Optimizer</Text>
           <Text style={styles.homeBtnSub}>
             Enter origin → destination and find the cheapest gas station along your route
           </Text>
@@ -200,7 +198,7 @@ function HomeScreen({ onNavigate }: { onNavigate: (s: Screen) => void }) {
           onPress={() => onNavigate('calculator')}
           activeOpacity={0.85}
         >
-          <Text style={styles.homeBtnTitle}>🧮  Quick Calculator</Text>
+          <Text style={styles.homeBtnTitle}>Quick Calculator</Text>
           <Text style={styles.homeBtnSub}>
             Manually enter two gas prices and get the True Cost breakdown instantly
           </Text>
@@ -240,7 +238,7 @@ function CalculatorScreen({ onBack }: { onBack: () => void }) {
 
         <View style={isDesktop ? styles.dualCol : styles.singleCol}>
           <View style={[styles.panel, isDesktop && styles.panelLeft]}>
-            <Text style={styles.sectionTitle}>⚙ Trip Parameters</Text>
+            <Text style={styles.sectionTitle}>Trip Parameters</Text>
             {FIELDS.map(field => (
               <StepInput key={field.key} field={field} value={inputs[field.key]} onChange={handleChange} />
             ))}
@@ -249,7 +247,7 @@ function CalculatorScreen({ onBack }: { onBack: () => void }) {
           <View style={[styles.panel, isDesktop && styles.panelRight]}>
             <VerdictCard netSavings={r.netSavings} />
 
-            <Text style={[styles.sectionTitle, { marginTop: 24 }]}>💰 Cost Breakdown</Text>
+            <Text style={[styles.sectionTitle, { marginTop: 24 }]}>Cost Breakdown</Text>
             <View style={styles.grid2x2}>
               <MetricTile label="Gross Savings"  value={fmt(r.grossSavings)}   accent={r.grossSavings >= 0 ? C.emerald : C.rose} />
               <MetricTile label="Fuel Wasted"    value={fmt(r.fuelWastedCost)} accent={C.amber} />
@@ -257,7 +255,7 @@ function CalculatorScreen({ onBack }: { onBack: () => void }) {
               <MetricTile label="Net Bottom Line" value={fmt(r.netSavings)}    accent={r.netSavings >= 0 ? C.emerald : C.rose} />
             </View>
 
-            <Text style={[styles.sectionTitle, { marginTop: 24 }]}>📊 FinTech Insights</Text>
+            <Text style={[styles.sectionTitle, { marginTop: 24 }]}>Cost Insights</Text>
             <View style={styles.insightsBox}>
               <InsightRow label="Effective Detour Hourly Rate" value={`${fmt(r.effectiveRate, 2)}/hr`} />
               <View style={styles.insightDivider} />

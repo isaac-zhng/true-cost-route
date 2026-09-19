@@ -21,7 +21,7 @@ import NavigationBar  from '../components/NavigationBar';
 import { haversineM, speak, cancelSpeech, ANNOUNCE_THRESHOLDS } from '../lib/navigation';
 import type { RouteStep }    from '../lib/navigation';
 import type { RankedStation } from '../lib/optimizer';
-import type { RouteResult, LngLat } from '../lib/routing';
+import { getRoute, type RouteResult, type LngLat } from '../lib/routing';
 
 // ─── Types & constants ────────────────────────────────────────────────────────
 const PANEL_W    = 380;
@@ -31,10 +31,12 @@ const STEP_ADV_M = 50;     // advance step when within this many meters of maneu
 // Lazy-load web-only MapView
 let MapViewComponent: React.ComponentType<{
   route: RouteResult | null;
+  baseRoute?: RouteResult | null;
   stations: RankedStation[];
   selectedStation: RankedStation | null;
   onSelectStation: (s: RankedStation | null) => void;
   isNavigating?: boolean;
+  isLoadingDetour?: boolean;
   userLat?: number | null;
   userLng?: number | null;
   userHeading?: number | null;
@@ -55,10 +57,17 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
   const isWide    = width >= 720;
 
   // ── Route / station state ──
+  const [baseRoute,       setBaseRoute]       = useState<RouteResult | null>(null);
   const [route,           setRoute]           = useState<RouteResult | null>(null);
+  const [originCoords,    setOriginCoords]    = useState<LngLat | null>(null);
+  const [destCoords,      setDestCoords]      = useState<LngLat | null>(null);
   const [stations,        setStations]        = useState<RankedStation[]>([]);
   const [selectedStation, setSelectedStation] = useState<RankedStation | null>(null);
+  const [isLoadingDetour, setIsLoadingDetour] = useState<boolean>(false);
   const [sheetOpen,       setSheetOpen]       = useState(true);
+
+  // In-memory cache of projected detour routes keyed by station ID
+  const projectedRoutesCache = useRef<Map<string, RouteResult>>(new Map());
 
   // ── Navigation state ──
   const [isNavigating,    setIsNavigating]    = useState(false);
@@ -86,9 +95,13 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
   useEffect(() => { voiceMutedRef.current = voiceMuted; }, [voiceMuted]);
 
   // ── Route / stations handlers ──
-  const handleRouteFound = useCallback((r: RouteResult, _o: LngLat, _d: LngLat) => {
+  const handleRouteFound = useCallback((r: RouteResult, o: LngLat, d: LngLat) => {
+    setBaseRoute(r);
     setRoute(r);
+    setOriginCoords(o);
+    setDestCoords(d);
     setSelectedStation(null);
+    projectedRoutesCache.current.clear();
     stepsRef.current = r.steps;
     // Compute initial total distance
     const total = r.steps.reduce((acc, s) => acc + s.distanceM, 0);
@@ -99,6 +112,56 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
     setStations(s);
     setSelectedStation(null);
   }, []);
+
+  // When a gas station is selected, immediately project the detour route through that station
+  const handleSelectStation = useCallback(async (station: RankedStation | null) => {
+    if (!station) {
+      setSelectedStation(null);
+      setRoute(baseRoute);
+      if (baseRoute) {
+        stepsRef.current = baseRoute.steps;
+        const total = baseRoute.steps.reduce((acc, st) => acc + st.distanceM, 0);
+        setTotalRemainM(total);
+      }
+      return;
+    }
+
+    setSelectedStation(station);
+
+    // 1. Check cache for instant display
+    const cached = projectedRoutesCache.current.get(station.id);
+    if (cached) {
+      setRoute(cached);
+      stepsRef.current = cached.steps;
+      const total = cached.steps.reduce((acc, st) => acc + st.distanceM, 0);
+      setTotalRemainM(total);
+      return;
+    }
+
+    // 2. Fetch projected route: origin -> gas station -> destination
+    if (originCoords && destCoords) {
+      setIsLoadingDetour(true);
+      try {
+        const projected = await getRoute(originCoords, destCoords, [{ lat: station.lat, lng: station.lng }]);
+        if (projected) {
+          projectedRoutesCache.current.set(station.id, projected);
+          setSelectedStation(current => {
+            if (current?.id === station.id) {
+              setRoute(projected);
+              stepsRef.current = projected.steps;
+              const total = projected.steps.reduce((acc, st) => acc + st.distanceM, 0);
+              setTotalRemainM(total);
+            }
+            return current;
+          });
+        }
+      } catch (err) {
+        console.warn('[MapScreen] Failed to calculate projected route for station:', err);
+      } finally {
+        setIsLoadingDetour(false);
+      }
+    }
+  }, [baseRoute, originCoords, destCoords]);
 
   // ── Geolocation position handler ──
   const handlePosition = useCallback((pos: GeolocationPosition) => {
@@ -171,7 +234,8 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
     stepsRef.current = route.steps;
     setIsNavigating(true);
 
-    speak(`Starting navigation. ${route.steps[0].instruction}`, voiceMutedRef.current);
+    const destName = selectedStation ? `gas stop at ${selectedStation.name}` : 'destination';
+    speak(`Starting navigation to ${destName}. ${route.steps[0].instruction}`, voiceMutedRef.current);
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       handlePosition,
@@ -185,7 +249,7 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
       },
       { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 },
     );
-  }, [route, handlePosition]);
+  }, [route, selectedStation, handlePosition]);
 
   // ── Stop navigation ──
   const stopNavigation = useCallback(() => {
@@ -201,6 +265,22 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
     setUserHeading(null);
     setUserSpeedMs(null);
     announcedRef.current.clear();
+  }, []);
+
+  // Query initial location for search suggestions bias
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.geolocation && userLat === null) {
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          setUserLat(pos.coords.latitude);
+          setUserLng(pos.coords.longitude);
+        },
+        err => {
+          console.log('[GPS] Initial location check:', err.message);
+        },
+        { enableHighAccuracy: false, timeout: 6000, maximumAge: 300000 },
+      );
+    }
   }, []);
 
   // Cleanup on unmount
@@ -238,12 +318,16 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
     </View>
   ) : null;
 
-  // ── Start navigation floating button ──
+  // ── Start navigation button (docked with the right-side panel) ──
   const startBtn = hasRoute && !isNavigating ? (
-    <View style={[styles.startBtnWrap, isWide ? styles.startBtnDesktop : styles.startBtnMobile]}>
+    <View style={styles.panelFooter}>
       {geoError && <Text style={styles.geoError}>{geoError}</Text>}
       <TouchableOpacity style={styles.startBtn} onPress={startNavigation} activeOpacity={0.85}>
-        <Text style={styles.startBtnText}>▶  Start Navigation</Text>
+        <Text style={styles.startBtnText}>
+          {selectedStation
+            ? `Start Navigation (via ${selectedStation.name})`
+            : 'Start Navigation'}
+        </Text>
       </TouchableOpacity>
     </View>
   ) : null;
@@ -257,31 +341,35 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
         <View style={styles.mapFlex}>
           <MV
             route={route}
+            baseRoute={baseRoute}
             stations={stations}
             selectedStation={selectedStation}
-            onSelectStation={setSelectedStation}
+            onSelectStation={handleSelectStation}
             isNavigating={isNavigating}
+            isLoadingDetour={isLoadingDetour}
             userLat={userLat}
             userLng={userLng}
             userHeading={userHeading}
           />
         </View>
 
-        {/* Floating right panel */}
+        {/* Floating right panel with integrated Start Navigation */}
         <View style={styles.floatingPanel}>
           <SearchPanel
             onRouteFound={handleRouteFound}
             onStationsFound={handleStationsFound}
-            onSelectStation={setSelectedStation}
+            onSelectStation={handleSelectStation}
             selectedStation={selectedStation}
             stations={stations}
             onOpenCalculator={onOpenCalculator}
+            userLat={userLat}
+            userLng={userLng}
           />
+          {startBtn}
         </View>
 
         {/* Navigation bar — top center overlay */}
         {navBar}
-        {startBtn}
       </View>
     );
   }
@@ -294,10 +382,12 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
       <View style={styles.mapFlex}>
         <MV
           route={route}
+          baseRoute={baseRoute}
           stations={stations}
           selectedStation={selectedStation}
-          onSelectStation={setSelectedStation}
+          onSelectStation={handleSelectStation}
           isNavigating={isNavigating}
+          isLoadingDetour={isLoadingDetour}
           userLat={userLat}
           userLng={userLng}
           userHeading={userHeading}
@@ -306,9 +396,8 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
 
       {/* Navigation bar (full width at top) */}
       {navBar}
-      {startBtn}
 
-      {/* Bottom sheet */}
+      {/* Bottom sheet with integrated Start Navigation */}
       {!isNavigating && (
         <View style={styles.bottomContainer}>
           <TouchableOpacity style={styles.sheetPill} onPress={() => setSheetOpen(p => !p)} activeOpacity={0.8}>
@@ -320,11 +409,14 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
               <SearchPanel
                 onRouteFound={handleRouteFound}
                 onStationsFound={handleStationsFound}
-                onSelectStation={setSelectedStation}
+                onSelectStation={handleSelectStation}
                 selectedStation={selectedStation}
                 stations={stations}
                 onOpenCalculator={onOpenCalculator}
+                userLat={userLat}
+                userLng={userLng}
               />
+              {startBtn}
             </View>
           )}
         </View>
@@ -356,6 +448,8 @@ const styles = StyleSheet.create({
     backgroundColor: '#FFFFFF',
     borderRadius: 16,
     overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column',
     ...(panelShadow as object),
   },
 
@@ -375,42 +469,37 @@ const styles = StyleSheet.create({
     right: 0,
   },
 
-  // Start navigation button
-  startBtnWrap: {
-    position: 'absolute',
-    alignItems: 'center',
-  },
-  startBtnDesktop: {
-    bottom: MARGIN + 8,
-    left:   MARGIN,
-    right:  PANEL_W + MARGIN * 2 + MARGIN,
-  },
-  startBtnMobile: {
-    bottom: 220,
-    left:   MARGIN,
-    right:  MARGIN,
+  // Panel footer with Start Navigation button
+  panelFooter: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderTopWidth: 1,
+    borderTopColor: '#E8EAED',
+    backgroundColor: '#FFFFFF',
   },
   startBtn: {
     backgroundColor: '#1A73E8',
-    borderRadius: 28,
-    paddingVertical: 14,
-    paddingHorizontal: 28,
+    borderRadius: 24,
+    paddingVertical: 13,
+    paddingHorizontal: 20,
     alignItems: 'center',
+    justifyContent: 'center',
     ...(Platform.OS === 'web'
-      ? ({ boxShadow: '0 4px 16px rgba(26,115,232,0.4)' } as object)
-      : { shadowColor: '#1A73E8', shadowOpacity: 0.4, shadowRadius: 10, shadowOffset: { width: 0, height: 4 }, elevation: 8 }),
+      ? ({ boxShadow: '0 2px 8px rgba(26,115,232,0.35)' } as object)
+      : { shadowColor: '#1A73E8', shadowOpacity: 0.35, shadowRadius: 6, shadowOffset: { width: 0, height: 2 }, elevation: 4 }),
   },
   startBtnText: {
     color: '#FFFFFF',
     fontSize: 15,
     fontWeight: '700',
-    letterSpacing: 0.3,
+    letterSpacing: 0.2,
+    textAlign: 'center',
   },
   geoError: {
     color: '#C5221F',
     fontSize: 12,
     textAlign: 'center',
-    backgroundColor: 'rgba(255,255,255,0.95)',
+    backgroundColor: '#FCE8E6',
     borderRadius: 8,
     padding: 8,
     marginBottom: 8,
@@ -438,9 +527,11 @@ const styles = StyleSheet.create({
     fontSize: 13, fontWeight: '600', color: '#5F6368',
   },
   bottomSheet: {
-    height: 400,
+    height: 440,
     backgroundColor: '#FFFFFF',
     overflow: 'hidden',
+    display: 'flex',
+    flexDirection: 'column',
   },
 
   notWeb: {

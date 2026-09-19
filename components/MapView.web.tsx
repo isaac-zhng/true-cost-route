@@ -3,6 +3,7 @@
  * Light positron base map, blue route polyline, colored station pins, white popups.
  */
 import React, { useCallback, useEffect, useRef } from 'react';
+import * as maplibregl from 'maplibre-gl';
 import Map, {
   Source,
   Layer,
@@ -16,13 +17,20 @@ import { AVAILABLE_MAP_STYLES } from '../constants/config';
 import type { RankedStation } from '../lib/optimizer';
 import type { RouteResult } from '../lib/routing';
 
+// Configure MapLibre Web Worker for Metro / Expo Web bundler
+if (typeof window !== 'undefined') {
+  maplibregl.setWorkerUrl('https://unpkg.com/maplibre-gl@6.10.0/dist/maplibre-gl-worker.mjs');
+}
+
 interface MapViewProps {
   route:           RouteResult | null;
+  baseRoute?:      RouteResult | null;
   stations:        RankedStation[];
   selectedStation: RankedStation | null;
   onSelectStation: (s: RankedStation | null) => void;
   // Navigation
   isNavigating?:   boolean;
+  isLoadingDetour?: boolean;
   userLat?:        number | null;
   userLng?:        number | null;
   userHeading?:    number | null;
@@ -43,6 +51,25 @@ const routeLineLayer: LayerProps = {
   paint: { 'line-color': '#4285F4', 'line-width': 5, 'line-opacity': 1 },
 };
 
+// Subtle / faded line for the original direct route when a detour is projected
+const baseRouteOutlineLayer: LayerProps = {
+  id: 'base-route-outline',
+  type: 'line',
+  layout: { 'line-join': 'round', 'line-cap': 'round' },
+  paint: { 'line-color': '#FFFFFF', 'line-width': 6, 'line-opacity': 0.6 },
+};
+
+const baseRouteLineLayer: LayerProps = {
+  id: 'base-route-line',
+  type: 'line',
+  layout: { 'line-join': 'round', 'line-cap': 'round' },
+  paint: {
+    'line-color': '#9AA0A6',
+    'line-width': 4,
+    'line-opacity': 0.8,
+  },
+};
+
 // ─── Color scale: green → yellow → red by price ──────────────────────────────
 function pinColor(price: number, min: number, max: number): string {
   if (max === min) return '#34A853';
@@ -61,8 +88,8 @@ function fmtAbs(n: number, d = 2) {
 
 // ─── Component ────────────────────────────────────────────────────────────────
 export default function MapView({
-  route, stations, selectedStation, onSelectStation,
-  isNavigating = false, userLat = null, userLng = null, userHeading = null,
+  route, baseRoute, stations, selectedStation, onSelectStation,
+  isNavigating = false, isLoadingDetour = false, userLat = null, userLng = null, userHeading = null,
 }: MapViewProps) {
   const mapRef   = useRef<MapRef>(null);
   const minPrice = stations.length ? Math.min(...stations.map(s => s.pricePerGallon)) : 0;
@@ -70,7 +97,7 @@ export default function MapView({
   const best     = stations.find(s => s.isWorthIt) ?? null;
 
   // Style state & menu
-  const [selectedStyleId, setSelectedStyleId] = React.useState<string>('bright');
+  const [selectedStyleId, setSelectedStyleId] = React.useState<string>('liberty');
   const [showStyleMenu, setShowStyleMenu]     = React.useState<boolean>(false);
 
   const activeStyle = AVAILABLE_MAP_STYLES.find(s => s.id === selectedStyleId) ?? AVAILABLE_MAP_STYLES[0];
@@ -94,6 +121,10 @@ export default function MapView({
         0%   { transform: scale(1);   opacity: 0.5; }
         100% { transform: scale(2.5); opacity: 0; }
       }
+      @keyframes spin {
+        0%   { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
     `;
     document.head.appendChild(override);
   }, []);
@@ -116,8 +147,40 @@ export default function MapView({
     mapRef.current.easeTo({ pitch: 0, bearing: 0, duration: 600 });
   }, [isNavigating]);
 
+  // ── Smooth camera adjustment when route or projected detour changes ──
+  useEffect(() => {
+    if (!route || !mapRef.current || isNavigating) return;
+    const [w, s, e, n] = route.bbox;
+    mapRef.current.fitBounds([[w, s], [e, n]], { padding: 80, duration: 800 });
+  }, [route, isNavigating]);
+
+  // ── Keyboard zoom shortcuts (+ / -) ──
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea') return;
+
+      if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        mapRef.current?.zoomIn({ duration: 250 });
+      } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        mapRef.current?.zoomOut({ duration: 250 });
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   const onMapLoad = useCallback(() => {
-    if (!route || !mapRef.current) return;
+    if (!mapRef.current) return;
+    const map = mapRef.current.getMap();
+    if (map.scrollZoom) {
+      map.scrollZoom.setWheelZoomRate(1 / 200); // 2x more responsive mouse wheel zoom
+      map.scrollZoom.setZoomRate(1 / 50);      // smooth, responsive trackpad zoom
+    }
+    if (!route) return;
     const [w, s, e, n] = route.bbox;
     mapRef.current.fitBounds([[w, s], [e, n]], { padding: 80, duration: 900 });
   }, [route]);
@@ -126,15 +189,16 @@ export default function MapView({
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       <Map
         ref={mapRef}
+        mapLib={maplibregl}
         initialViewState={{ longitude: -98.5795, latitude: 39.8283, zoom: 4 }}
         style={{ width: '100%', height: '100%' }}
         mapStyle={activeStyle.url as any}
         onLoad={onMapLoad}
         onClick={() => onSelectStation(null)}
         onError={(err) => {
-          console.warn('Map style loading error, recovering:', err);
-          if (selectedStyleId !== 'bright') {
-            setSelectedStyleId('bright');
+          console.warn('Map style loading error, recovering to Streets:', err);
+          if (selectedStyleId !== 'liberty') {
+            setSelectedStyleId('liberty');
           }
         }}
       >
@@ -184,7 +248,15 @@ export default function MapView({
         </Marker>
       )}
 
-      {/* Route */}
+      {/* Base direct route (rendered as subtle gray line when detour route is active) */}
+      {baseRoute && selectedStation && route && baseRoute !== route && (
+        <Source id="base-route" type="geojson" data={{ type: 'Feature', geometry: baseRoute.geometry, properties: {} }}>
+          <Layer {...baseRouteOutlineLayer} />
+          <Layer {...baseRouteLineLayer} />
+        </Source>
+      )}
+
+      {/* Active route (projected detour route if station selected, or base route if none) */}
       {route && (
         <Source id="route" type="geojson" data={{ type: 'Feature', geometry: route.geometry, properties: {} }}>
           <Layer {...routeOutlineLayer} />
@@ -228,7 +300,11 @@ export default function MapView({
                 transition: 'all 0.15s ease',
               }}
             >
-              {isBest ? '★' : ''}
+              {isBest ? (
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="#FFFFFF">
+                  <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+                </svg>
+              ) : null}
             </div>
           </Marker>
         );
@@ -245,7 +321,7 @@ export default function MapView({
           onClose={() => onSelectStation(null)}
         >
           <div style={{
-            width: 248,
+            width: 275,
             fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
             backgroundColor: '#fff',
             borderRadius: 12,
@@ -279,138 +355,314 @@ export default function MapView({
               </div>
 
               {/* Price */}
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 3, marginBottom: 10 }}>
-                <span style={{ fontSize: 28, fontWeight: 700, color: '#202124', lineHeight: 1 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 3, marginBottom: 8 }}>
+                <span style={{ fontSize: 26, fontWeight: 700, color: '#202124', lineHeight: 1 }}>
                   ${selectedStation.pricePerGallon.toFixed(3)}
                 </span>
                 <span style={{ fontSize: 12, color: '#5F6368' }}>/gal regular</span>
               </div>
 
-              {/* Stats grid */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 12px', marginBottom: 10 }}>
-                {[
-                  { label: 'Gross savings', val: selectedStation.grossSavingsVsLocal, prefix: true },
-                  { label: 'Fuel cost',     val: -selectedStation.fuelWastedCost,     prefix: false },
-                  { label: 'Time cost',     val: -selectedStation.timeCost,           prefix: false },
-                  { label: 'Net savings',   val: selectedStation.netSavings,          prefix: true, bold: true },
-                ].map(item => (
-                  <div key={item.label}>
-                    <div style={{ fontSize: 10, color: '#80868B', marginBottom: 1 }}>{item.label}</div>
-                    <div style={{
-                      fontSize: item.bold ? 15 : 13,
-                      fontWeight: item.bold ? 700 : 500,
-                      color: item.val >= 0 ? '#137333' : '#C5221F',
-                    }}>
-                      {item.val >= 0 ? '+' : '−'}{fmtAbs(item.val)}
+              {/* True Cost Breakdown */}
+              <div style={{
+                backgroundColor: '#F8F9FA',
+                borderRadius: 8,
+                padding: '9px 10px',
+                marginBottom: 10,
+                border: '1px solid #E8EAED',
+              }}>
+                <div style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: '#5F6368',
+                  textTransform: 'uppercase',
+                  letterSpacing: 0.5,
+                  marginBottom: 6,
+                }}>
+                  True Cost Breakdown
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 }}>
+                    <div>
+                      <span style={{ color: '#202124', fontWeight: 500 }}>Pump discount</span>
+                      <div style={{ fontSize: 10, color: '#80868B' }}>Cheaper gas at station</div>
                     </div>
+                    <span style={{ fontWeight: 600, color: '#137333' }}>
+                      +${Math.abs(selectedStation.grossSavingsVsLocal).toFixed(2)}
+                    </span>
                   </div>
-                ))}
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 }}>
+                    <div>
+                      <span style={{ color: '#202124', fontWeight: 500 }}>Fuel burned</span>
+                      <div style={{ fontSize: 10, color: '#80868B' }}>Driving +{selectedStation.detourMiles.toFixed(1)} mi</div>
+                    </div>
+                    <span style={{ fontWeight: 600, color: '#C5221F' }}>
+                      −${selectedStation.fuelWastedCost.toFixed(2)}
+                    </span>
+                  </div>
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 }}>
+                    <div>
+                      <span style={{ color: '#202124', fontWeight: 500 }}>Time value</span>
+                      <div style={{ fontSize: 10, color: '#80868B' }}>Driving +{Math.round(selectedStation.detourMinutes)} min</div>
+                    </div>
+                    <span style={{ fontWeight: 600, color: '#C5221F' }}>
+                      −${selectedStation.timeCost.toFixed(2)}
+                    </span>
+                  </div>
+
+                  <div style={{ height: 1, backgroundColor: '#E8EAED', margin: '2px 0' }} />
+
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div>
+                      <span style={{ fontWeight: 700, fontSize: 12, color: '#202124' }}>
+                        {selectedStation.isWorthIt ? 'Net in pocket:' : 'Net detour loss:'}
+                      </span>
+                      <div style={{ fontSize: 10, color: selectedStation.isWorthIt ? '#137333' : '#C5221F' }}>
+                        {selectedStation.isWorthIt ? 'Real money saved' : 'Detour costs extra'}
+                      </div>
+                    </div>
+                    <span style={{
+                      fontWeight: 800,
+                      fontSize: 14,
+                      color: selectedStation.isWorthIt ? '#137333' : '#C5221F',
+                    }}>
+                      {selectedStation.isWorthIt
+                        ? `Save $${selectedStation.netSavings.toFixed(2)}`
+                        : `Lose $${Math.abs(selectedStation.netSavings).toFixed(2)}`}
+                    </span>
+                  </div>
+                </div>
               </div>
 
-              {/* Verdict pill */}
-              <div style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 4,
-                padding: '4px 10px',
-                borderRadius: 20,
-                fontSize: 12,
-                fontWeight: 600,
-                backgroundColor: selectedStation.isWorthIt ? '#E6F4EA' : '#FCE8E6',
-                color: selectedStation.isWorthIt ? '#137333' : '#C5221F',
-              }}>
-                <span>{selectedStation.isWorthIt ? '✓' : '✕'}</span>
-                <span>{selectedStation.isWorthIt ? 'Worth the detour' : 'Skip this station'}</span>
+              {/* Verdict pill + Route projection status */}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap' }}>
+                <div style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  padding: '4px 10px',
+                  borderRadius: 20,
+                  fontSize: 12,
+                  fontWeight: 600,
+                  backgroundColor: selectedStation.isWorthIt ? '#E6F4EA' : '#FCE8E6',
+                  color: selectedStation.isWorthIt ? '#137333' : '#C5221F',
+                }}>
+                  <span>{selectedStation.isWorthIt ? 'Worth the detour' : 'Skip this station'}</span>
+                </div>
+
+                {isLoadingDetour ? (
+                  <span style={{ fontSize: 11, color: '#1A73E8', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <span style={{ display: 'inline-block', width: 9, height: 9, border: '2px solid #1A73E8', borderTopColor: 'transparent', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+                    Projecting…
+                  </span>
+                ) : (
+                  <span style={{ fontSize: 11, color: '#137333', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 5 }}>
+                    <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', backgroundColor: '#137333' }} />
+                    Route projected
+                  </span>
+                )}
               </div>
             </div>
           </div>
         </Popup>
       )}
 
-      {/* Layer Switcher Button & Menu (Google Maps style, bottom-left) */}
+      {/* Bottom control bar: Map Types + Zoom Controls + Fit Route */}
       <div style={{
         position: 'absolute',
         bottom: 24,
         left: 24,
         zIndex: 50,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 10,
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
       }}>
-        {showStyleMenu && (
-          <div style={{
-            position: 'absolute',
-            bottom: 50,
-            left: 0,
-            backgroundColor: '#FFFFFF',
-            borderRadius: 12,
-            boxShadow: '0 4px 20px rgba(0,0,0,0.18)',
-            padding: '8px 6px',
-            minWidth: 190,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 4,
-          }}>
+        {/* Layer Switcher */}
+        <div style={{ position: 'relative' }}>
+          {showStyleMenu && (
             <div style={{
-              fontSize: 11,
-              fontWeight: 700,
-              color: '#80868B',
-              padding: '4px 10px',
-              textTransform: 'uppercase',
-              letterSpacing: 0.5,
+              position: 'absolute',
+              bottom: 48,
+              left: 0,
+              backgroundColor: '#FFFFFF',
+              borderRadius: 12,
+              boxShadow: '0 4px 20px rgba(0,0,0,0.18)',
+              padding: '8px 6px',
+              minWidth: 190,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 4,
             }}>
-              Map Types
+              <div style={{
+                fontSize: 11,
+                fontWeight: 700,
+                color: '#80868B',
+                padding: '4px 10px',
+                textTransform: 'uppercase',
+                letterSpacing: 0.5,
+              }}>
+                Map Types
+              </div>
+              {AVAILABLE_MAP_STYLES.map(style => (
+                <button
+                  key={style.id}
+                  onClick={() => {
+                    setSelectedStyleId(style.id);
+                    setShowStyleMenu(false);
+                  }}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 10,
+                    padding: '8px 10px',
+                    borderRadius: 8,
+                    border: 'none',
+                    backgroundColor: selectedStyleId === style.id ? '#E8F0FE' : 'transparent',
+                    color: selectedStyleId === style.id ? '#1A73E8' : '#202124',
+                    fontWeight: selectedStyleId === style.id ? 700 : 500,
+                    fontSize: 13,
+                    cursor: 'pointer',
+                    textAlign: 'left',
+                    transition: 'background-color 0.15s ease',
+                  }}
+                >
+                  <span>{style.label}</span>
+                </button>
+              ))}
             </div>
-            {AVAILABLE_MAP_STYLES.map(style => (
-              <button
-                key={style.id}
-                onClick={() => {
-                  setSelectedStyleId(style.id);
-                  setShowStyleMenu(false);
-                }}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 10,
-                  padding: '8px 10px',
-                  borderRadius: 8,
-                  border: 'none',
-                  backgroundColor: selectedStyleId === style.id ? '#E8F0FE' : 'transparent',
-                  color: selectedStyleId === style.id ? '#1A73E8' : '#202124',
-                  fontWeight: selectedStyleId === style.id ? 700 : 500,
-                  fontSize: 13,
-                  cursor: 'pointer',
-                  textAlign: 'left',
-                  transition: 'background-color 0.15s ease',
-                }}
-              >
-                <span style={{ fontSize: 16 }}>{style.icon}</span>
-                <span>{style.label}</span>
-              </button>
-            ))}
-          </div>
-        )}
+          )}
 
-        <button
-          onClick={() => setShowStyleMenu(!showStyleMenu)}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 8,
-            backgroundColor: '#FFFFFF',
-            borderRadius: 24,
-            border: '1px solid rgba(0,0,0,0.08)',
-            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
-            padding: '8px 14px',
-            fontSize: 13,
-            fontWeight: 600,
-            color: '#202124',
-            cursor: 'pointer',
-            transition: 'box-shadow 0.15s ease, transform 0.15s ease',
-          }}
-        >
-          <span>{activeStyle.icon}</span>
-          <span>{activeStyle.label}</span>
-          <span style={{ fontSize: 10, color: '#5F6368', marginLeft: 2 }}>{showStyleMenu ? '▼' : '▲'}</span>
-        </button>
+          <button
+            onClick={() => setShowStyleMenu(!showStyleMenu)}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              height: 38,
+              boxSizing: 'border-box',
+              backgroundColor: '#FFFFFF',
+              borderRadius: 24,
+              border: '1px solid rgba(0,0,0,0.08)',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+              padding: '0 14px',
+              fontSize: 13,
+              fontWeight: 600,
+              color: '#202124',
+              cursor: 'pointer',
+              transition: 'box-shadow 0.15s ease, transform 0.15s ease',
+            }}
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#202124" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="12 2 2 7 12 12 22 7 12 2"/>
+              <polyline points="2 17 12 22 22 17"/>
+              <polyline points="2 12 12 17 22 12"/>
+            </svg>
+            <span>{activeStyle.label}</span>
+            <span style={{ fontSize: 10, color: '#5F6368', marginLeft: 2 }}>{showStyleMenu ? '▴' : '▾'}</span>
+          </button>
+        </div>
+
+        {/* Zoom Controls Pill (+ / −) */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          backgroundColor: '#FFFFFF',
+          borderRadius: 24,
+          border: '1px solid rgba(0,0,0,0.08)',
+          boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+          overflow: 'hidden',
+          height: 38,
+          boxSizing: 'border-box',
+        }}>
+          <button
+            onClick={() => mapRef.current?.zoomIn({ duration: 250 })}
+            title="Zoom In (or press +)"
+            style={{
+              width: 38,
+              height: 38,
+              boxSizing: 'border-box',
+              border: 'none',
+              backgroundColor: 'transparent',
+              fontSize: 18,
+              fontWeight: 700,
+              color: '#202124',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              transition: 'background-color 0.15s ease',
+            }}
+            onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#F1F3F4')}
+            onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+          >
+            +
+          </button>
+          <div style={{ width: 1, height: 18, backgroundColor: '#E8EAED' }} />
+          <button
+            onClick={() => mapRef.current?.zoomOut({ duration: 250 })}
+            title="Zoom Out (or press −)"
+            style={{
+              width: 38,
+              height: 38,
+              boxSizing: 'border-box',
+              border: 'none',
+              backgroundColor: 'transparent',
+              fontSize: 20,
+              fontWeight: 700,
+              color: '#202124',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              lineHeight: 1,
+              transition: 'background-color 0.15s ease',
+            }}
+            onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#F1F3F4')}
+            onMouseLeave={e => (e.currentTarget.style.backgroundColor = 'transparent')}
+          >
+            −
+          </button>
+        </div>
+
+        {/* Fit Route Button (shown when route exists) */}
+        {route && (
+          <button
+            onClick={() => {
+              const [w, s, e, n] = route.bbox;
+              mapRef.current?.fitBounds([[w, s], [e, n]], { padding: 80, duration: 600 });
+            }}
+            title="Fit Route to Screen"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              height: 38,
+              boxSizing: 'border-box',
+              backgroundColor: '#FFFFFF',
+              borderRadius: 24,
+              border: '1px solid rgba(0,0,0,0.08)',
+              boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+              padding: '0 14px',
+              fontSize: 13,
+              fontWeight: 600,
+              color: '#1A73E8',
+              cursor: 'pointer',
+              transition: 'background-color 0.15s ease, box-shadow 0.15s ease',
+            }}
+            onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#F8FAFD')}
+            onMouseLeave={e => (e.currentTarget.style.backgroundColor = '#FFFFFF')}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1A73E8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="7"/>
+              <line x1="12" y1="1" x2="12" y2="4"/>
+              <line x1="12" y1="20" x2="12" y2="23"/>
+              <line x1="1" y1="12" x2="4" y2="12"/>
+              <line x1="20" y1="12" x2="23" y2="12"/>
+            </svg>
+            <span>Fit Route</span>
+          </button>
+        )}
       </div>
     </Map>
     </div>

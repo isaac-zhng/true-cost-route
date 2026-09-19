@@ -19,6 +19,137 @@ declare global {
   }
 }
 
+// ─── Address Suggestions (Autocomplete with Location Bias) ────────────────────
+export interface AddressSuggestion {
+  id: string;
+  primaryText: string;
+  secondaryText: string;
+  fullText: string;
+  coords: LngLat;
+}
+
+/**
+ * Fetch address suggestions as the user types, biased to their current location.
+ * Uses Photon (OSM-based autocomplete) with a graceful fallback to Nominatim.
+ */
+export async function fetchAddressSuggestions(
+  query: string,
+  userLat?: number | null,
+  userLng?: number | null,
+): Promise<AddressSuggestion[]> {
+  const trimmed = query.trim();
+  if (trimmed.length < 2) return [];
+
+  // 1. Try Photon (specifically optimized for typeahead search with lat/lon bias)
+  try {
+    let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(trimmed)}&limit=5`;
+    if (typeof userLat === 'number' && typeof userLng === 'number' && !isNaN(userLat) && !isNaN(userLng)) {
+      url += `&lat=${userLat}&lon=${userLng}`;
+    }
+
+    const res = await fetch(url);
+    if (res.ok) {
+      const json = await res.json() as {
+        features?: Array<{
+          geometry: { coordinates: [number, number] };
+          properties?: {
+            osm_id?: number;
+            name?: string;
+            housenumber?: string;
+            street?: string;
+            locality?: string;
+            district?: string;
+            city?: string;
+            state?: string;
+            postcode?: string;
+            country?: string;
+          };
+        }>;
+      };
+
+      if (json.features && json.features.length > 0) {
+        return json.features.map(f => {
+          const p = f.properties || {};
+          const coords: LngLat = {
+            lng: f.geometry.coordinates[0],
+            lat: f.geometry.coordinates[1],
+          };
+
+          let primary = p.name || '';
+          if (p.housenumber && p.street) {
+            if (primary && primary !== p.housenumber && primary !== p.street) {
+              primary = `${primary}, ${p.housenumber} ${p.street}`;
+            } else {
+              primary = `${p.housenumber} ${p.street}`;
+            }
+          } else if (!primary && p.street) {
+            primary = p.street;
+          } else if (!primary) {
+            primary = p.city || p.locality || p.state || p.country || 'Location';
+          }
+
+          const parts: string[] = [];
+          if (p.city && p.city !== primary) parts.push(p.city);
+          else if (p.district) parts.push(p.district);
+          if (p.state) parts.push(p.state);
+          if (p.postcode) parts.push(p.postcode);
+          if (p.country) parts.push(p.country);
+
+          const secondary = parts.join(', ');
+          const full = secondary ? `${primary}, ${secondary}` : primary;
+
+          return {
+            id: `${p.osm_id ?? Math.random()}-${coords.lat}-${coords.lng}`,
+            primaryText: primary,
+            secondaryText: secondary,
+            fullText: full,
+            coords,
+          };
+        });
+      }
+    }
+  } catch (err) {
+    console.warn('[routing] Photon autocomplete failed, trying Nominatim fallback:', err);
+  }
+
+  // 2. Fallback to Nominatim
+  try {
+    let url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(trimmed)}&format=json&limit=5&addressdetails=1`;
+    if (typeof userLat === 'number' && typeof userLng === 'number' && !isNaN(userLat) && !isNaN(userLng)) {
+      url += `&viewbox=${userLng - 0.5},${userLat + 0.5},${userLng + 0.5},${userLat - 0.5}&bounded=0`;
+    }
+
+    const res = await fetch(url, {
+      headers: { 'User-Agent': NOMINATIM_USER_AGENT },
+    });
+    if (res.ok) {
+      const list = await res.json() as Array<{
+        place_id: number;
+        display_name: string;
+        lat: string;
+        lon: string;
+      }>;
+
+      return list.map(item => {
+        const parts = item.display_name.split(',').map(s => s.trim());
+        const primary = parts[0] || item.display_name;
+        const secondary = parts.slice(1).join(', ');
+        return {
+          id: `nom-${item.place_id}`,
+          primaryText: primary,
+          secondaryText: secondary,
+          fullText: item.display_name,
+          coords: { lng: parseFloat(item.lon), lat: parseFloat(item.lat) },
+        };
+      });
+    }
+  } catch (err) {
+    console.warn('[routing] Nominatim fallback failed:', err);
+  }
+
+  return [];
+}
+
 // ─── Geocoding via Nominatim (OpenStreetMap) ──────────────────────────────────
 // Free, no API key, no account. Rate limit: 1 req/sec — fine for MVP usage.
 export async function geocode(query: string): Promise<LngLat | null> {
@@ -41,8 +172,10 @@ export async function geocode(query: string): Promise<LngLat | null> {
 export async function getRoute(
   origin: LngLat,
   destination: LngLat,
+  waypoints?: LngLat[],
 ): Promise<RouteResult | null> {
-  const coords = `${origin.lng},${origin.lat};${destination.lng},${destination.lat}`;
+  const allPoints = [origin, ...(waypoints ?? []), destination];
+  const coords = allPoints.map(p => `${p.lng},${p.lat}`).join(';');
   const url =
     `https://router.project-osrm.org/route/v1/driving/${coords}` +
     `?geometries=geojson&overview=full&steps=true`;
@@ -84,12 +217,16 @@ export async function getRoute(
     Math.max(...lngs), Math.max(...lats),
   ];
 
-  // Parse turn-by-turn steps from all legs (usually just one leg)
-  const steps: RouteStep[] = route.legs.flatMap(leg =>
+  // Parse turn-by-turn steps from all legs (supports multi-leg detour routes)
+  const steps: RouteStep[] = route.legs.flatMap((leg, legIdx) =>
     leg.steps.map(s => {
       const type     = s.maneuver.type;
       const modifier = s.maneuver.modifier;
       const street   = s.name ?? '';
+      const isIntermediateStop = type === 'arrive' && legIdx < route.legs.length - 1;
+      const instruction = isIntermediateStop
+        ? 'Arrive at gas station'
+        : getInstruction(type, modifier, street);
       return {
         maneuverType: type,
         modifier,
@@ -98,7 +235,7 @@ export async function getRoute(
         durationS:    s.duration,
         maneuverLng:  s.maneuver.location[0],
         maneuverLat:  s.maneuver.location[1],
-        instruction:  getInstruction(type, modifier, street),
+        instruction,
         arrowSymbol:  getArrow(type, modifier),
       };
     }),
