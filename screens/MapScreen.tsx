@@ -40,6 +40,8 @@ let MapViewComponent: React.ComponentType<{
   userLat?: number | null;
   userLng?: number | null;
   userHeading?: number | null;
+  originCoords?: LngLat | null;
+  onUserLocation?: (lat: number, lng: number) => void;
 }> | null = null;
 
 if (Platform.OS === 'web') {
@@ -111,6 +113,15 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
   const handleStationsFound = useCallback((s: RankedStation[]) => {
     setStations(s);
     setSelectedStation(null);
+  }, []);
+
+  const handleUserLocation = useCallback((lat: number, lng: number) => {
+    setUserLat(lat);
+    setUserLng(lng);
+  }, []);
+
+  const handleOriginSelect = useCallback((coords: LngLat, _label: string) => {
+    setOriginCoords(coords);
   }, []);
 
   // When a gas station is selected, immediately project the detour route through that station
@@ -350,6 +361,8 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
             userLat={userLat}
             userLng={userLng}
             userHeading={userHeading}
+            originCoords={originCoords}
+            onUserLocation={handleUserLocation}
           />
         </View>
 
@@ -364,6 +377,8 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
             onOpenCalculator={onOpenCalculator}
             userLat={userLat}
             userLng={userLng}
+            onOriginSelect={handleOriginSelect}
+            onUserLocation={handleUserLocation}
           />
           {startBtn}
         </View>
@@ -391,6 +406,8 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
           userLat={userLat}
           userLng={userLng}
           userHeading={userHeading}
+          originCoords={originCoords}
+          onUserLocation={handleUserLocation}
         />
       </View>
 
@@ -415,6 +432,8 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
                 onOpenCalculator={onOpenCalculator}
                 userLat={userLat}
                 userLng={userLng}
+                onOriginSelect={handleOriginSelect}
+                onUserLocation={handleUserLocation}
               />
               {startBtn}
             </View>

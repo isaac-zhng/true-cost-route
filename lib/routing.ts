@@ -1,5 +1,6 @@
 import { NOMINATIM_USER_AGENT, SEARCH_RADIUS_MILES } from '../constants/config';
 import type { GasStation } from './gasApi';
+import { matchGasProgram } from './gasPrograms';
 import { getArrow, getInstruction, type RouteStep } from './navigation';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -252,7 +253,7 @@ interface OverpassNode {
   id: number;
   lat: number;
   lon: number;
-  tags?: { name?: string; 'addr:state'?: string; brand?: string };
+  tags?: { name?: string; 'addr:state'?: string; brand?: string; operator?: string };
 }
 
 export async function getStationsAlongRoute(
@@ -295,15 +296,21 @@ export async function getStationsAlongRoute(
     const nearestDist   = nearestPointDistanceMiles(el.lat, el.lon, sampled);
     const detourMiles   = +(nearestDist * 2).toFixed(2);
     const detourMinutes = +(detourMiles / 30 * 60).toFixed(1);
+    const program       = matchGasProgram(el.tags?.name, el.tags?.brand, el.tags?.operator);
 
     stations.push({
-      id:            String(el.id),
-      name:          el.tags?.name ?? el.tags?.brand ?? 'Gas Station',
-      lat:           el.lat,
-      lng:           el.lon,
+      id:                   String(el.id),
+      name:                 el.tags?.name ?? el.tags?.brand ?? (program ? `${program.name} Gas` : 'Gas Station'),
+      lat:                  el.lat,
+      lng:                  el.lon,
       state,
       detourMiles,
       detourMinutes,
+      programId:            program?.id,
+      programName:          program?.name,
+      programType:          program?.type,
+      isMembershipRequired: program?.isMandatory,
+      queueWaitMinutes:     program?.queueWaitMinutes,
     });
   }
 

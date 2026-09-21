@@ -6,6 +6,12 @@ export interface TripInputs {
   mpg: number;
   gallons: number;
   hourlyTimeValue: number;
+  /** Array of program IDs enrolled/held by the user (e.g. ['costco', 'kroger', 'circle_k']) */
+  enrolledProgramIds?: string[];
+  /** Legacy alias for backwards compatibility */
+  userMemberships?: string[];
+  /** If true, includes wholesale membership stations even if user doesn't hold the membership */
+  allowAllMemberships?: boolean;
 }
 
 export interface RankedStation extends GasStation {
@@ -33,8 +39,19 @@ export function rankStations(
 ): RankedStation[] {
   if (!stations.length) return [];
 
-  // Filter out unrealistic detours
-  const candidates = stations.filter(s => s.detourMiles <= MAX_DETOUR_MILES);
+  const enrolled = inputs.enrolledProgramIds ?? inputs.userMemberships ?? [];
+  const { mpg, gallons, hourlyTimeValue, allowAllMemberships = false } = inputs;
+
+  // Filter candidates:
+  // 1. Detour must be within MAX_DETOUR_MILES
+  // 2. If station requires a mandatory membership (e.g. wholesale club), user must have it
+  const candidates = stations.filter(s => {
+    if (s.detourMiles > MAX_DETOUR_MILES) return false;
+    if (s.isMembershipRequired && s.programId && !allowAllMemberships) {
+      if (!enrolled.includes(s.programId)) return false;
+    }
+    return true;
+  });
   if (!candidates.length) return [];
 
   // Reference price = median of all candidate prices

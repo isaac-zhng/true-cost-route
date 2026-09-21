@@ -15,7 +15,7 @@ import Map, {
 
 import { AVAILABLE_MAP_STYLES } from '../constants/config';
 import type { RankedStation } from '../lib/optimizer';
-import type { RouteResult } from '../lib/routing';
+import type { RouteResult, LngLat } from '../lib/routing';
 
 // Configure MapLibre Web Worker for Metro / Expo Web bundler
 if (typeof window !== 'undefined') {
@@ -34,6 +34,8 @@ interface MapViewProps {
   userLat?:        number | null;
   userLng?:        number | null;
   userHeading?:    number | null;
+  originCoords?:   LngLat | null;
+  onUserLocation?: (lat: number, lng: number) => void;
 }
 
 // ─── Route layer styles ───────────────────────────────────────────────────────
@@ -90,6 +92,7 @@ function fmtAbs(n: number, d = 2) {
 export default function MapView({
   route, baseRoute, stations, selectedStation, onSelectStation,
   isNavigating = false, isLoadingDetour = false, userLat = null, userLng = null, userHeading = null,
+  originCoords = null, onUserLocation,
 }: MapViewProps) {
   const mapRef   = useRef<MapRef>(null);
   const minPrice = stations.length ? Math.min(...stations.map(s => s.pricePerGallon)) : 0;
@@ -99,8 +102,19 @@ export default function MapView({
   // Style state & menu
   const [selectedStyleId, setSelectedStyleId] = React.useState<string>('liberty');
   const [showStyleMenu, setShowStyleMenu]     = React.useState<boolean>(false);
+  const [is3D, setIs3D]                       = React.useState<boolean>(false);
 
   const activeStyle = AVAILABLE_MAP_STYLES.find(s => s.id === selectedStyleId) ?? AVAILABLE_MAP_STYLES[0];
+
+  const toggle3D = useCallback(() => {
+    if (!mapRef.current) return;
+    const next = !is3D;
+    setIs3D(next);
+    mapRef.current.easeTo({
+      pitch: next ? 45 : 0,
+      duration: 500,
+    });
+  }, [is3D]);
 
   // Load maplibre CSS from CDN (Metro can't bundle node_modules CSS)
   useEffect(() => {
@@ -144,15 +158,69 @@ export default function MapView({
   // Reset pitch/bearing when navigation stops
   useEffect(() => {
     if (isNavigating || !mapRef.current) return;
-    mapRef.current.easeTo({ pitch: 0, bearing: 0, duration: 600 });
-  }, [isNavigating]);
+    mapRef.current.easeTo({ pitch: is3D ? 40 : 0, bearing: 0, duration: 600 });
+  }, [isNavigating, is3D]);
 
   // ── Smooth camera adjustment when route or projected detour changes ──
   useEffect(() => {
     if (!route || !mapRef.current || isNavigating) return;
     const [w, s, e, n] = route.bbox;
-    mapRef.current.fitBounds([[w, s], [e, n]], { padding: 80, duration: 800 });
-  }, [route, isNavigating]);
+    mapRef.current.fitBounds([[w, s], [e, n]], { padding: 80, duration: 800, pitch: is3D ? 35 : 0 });
+  }, [route, isNavigating, is3D]);
+
+  // ── Camera: Zoom into user location or selected origin when provided ──
+  const lastCenteredCoordRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (route || !mapRef.current) return;
+    const targetLng = originCoords?.lng ?? userLng;
+    const targetLat = originCoords?.lat ?? userLat;
+    if (targetLng === null || targetLat === null || targetLng === undefined || targetLat === undefined) return;
+
+    const coordKey = `${targetLng.toFixed(5)},${targetLat.toFixed(5)}`;
+    if (lastCenteredCoordRef.current === coordKey) return;
+    lastCenteredCoordRef.current = coordKey;
+
+    try {
+      const map = mapRef.current.getMap ? mapRef.current.getMap() : mapRef.current;
+      map.flyTo({
+        center:   [targetLng, targetLat],
+        zoom:     14,
+        pitch:    is3D ? 40 : 0,
+        duration: 1000,
+        essential: true,
+      });
+    } catch (err) {
+      console.warn('[MapView] flyTo user location failed:', err);
+    }
+  }, [userLat, userLng, originCoords, route, is3D]);
+
+  // If user coordinates are not yet set, request browser geolocation on mount with generous timeout
+  useEffect(() => {
+    if (route) return;
+    if (typeof navigator !== 'undefined' && navigator.geolocation && userLat === null && userLng === null) {
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          onUserLocation?.(pos.coords.latitude, pos.coords.longitude);
+          if (mapRef.current && !lastCenteredCoordRef.current) {
+            lastCenteredCoordRef.current = `${pos.coords.longitude.toFixed(5)},${pos.coords.latitude.toFixed(5)}`;
+            const map = mapRef.current.getMap ? mapRef.current.getMap() : mapRef.current;
+            map.flyTo({
+              center:   [pos.coords.longitude, pos.coords.latitude],
+              zoom:     14,
+              pitch:    is3D ? 40 : 0,
+              duration: 1000,
+              essential: true,
+            });
+          }
+        },
+        err => {
+          console.log('[GPS] Map mount location check:', err.message);
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 },
+      );
+    }
+  }, [userLat, userLng, route, is3D, onUserLocation]);
 
   // ── Keyboard zoom shortcuts (+ / -) ──
   useEffect(() => {
@@ -175,22 +243,45 @@ export default function MapView({
 
   const onMapLoad = useCallback(() => {
     if (!mapRef.current) return;
-    const map = mapRef.current.getMap();
+    const map = mapRef.current.getMap ? mapRef.current.getMap() : mapRef.current;
     if (map.scrollZoom) {
       map.scrollZoom.setWheelZoomRate(1 / 200); // 2x more responsive mouse wheel zoom
       map.scrollZoom.setZoomRate(1 / 50);      // smooth, responsive trackpad zoom
     }
-    if (!route) return;
-    const [w, s, e, n] = route.bbox;
-    mapRef.current.fitBounds([[w, s], [e, n]], { padding: 80, duration: 900 });
-  }, [route]);
+    if (route) {
+      const [w, s, e, n] = route.bbox;
+      map.fitBounds([[w, s], [e, n]], { padding: 80, duration: 900, pitch: is3D ? 35 : 0 });
+    } else {
+      const targetLng = originCoords?.lng ?? userLng;
+      const targetLat = originCoords?.lat ?? userLat;
+      if (targetLng !== null && targetLat !== null && targetLng !== undefined && targetLat !== undefined) {
+        lastCenteredCoordRef.current = `${targetLng.toFixed(5)},${targetLat.toFixed(5)}`;
+        map.flyTo({
+          center:   [targetLng, targetLat],
+          zoom:     14,
+          pitch:    is3D ? 40 : 0,
+          duration: 1000,
+          essential: true,
+        });
+      }
+    }
+  }, [route, originCoords, userLat, userLng, is3D]);
 
   return (
     <div style={{ position: 'relative', width: '100%', height: '100%' }}>
       <Map
         ref={mapRef}
         mapLib={maplibregl}
-        initialViewState={{ longitude: -98.5795, latitude: 39.8283, zoom: 4 }}
+        initialViewState={{
+          longitude: userLng ?? -98.5795,
+          latitude:  userLat ?? 39.8283,
+          zoom:      userLat !== null ? 14 : 11,
+          pitch:     0,
+          bearing:   0,
+        }}
+        maxPitch={75}
+        dragRotate={true}
+        pitchWithRotate={true}
         style={{ width: '100%', height: '100%' }}
         mapStyle={activeStyle.url as any}
         onLoad={onMapLoad}
@@ -244,6 +335,25 @@ export default function MapView({
                 transformOrigin: '50% calc(100% + 12px)',
               }} />
             )}
+          </div>
+        </Marker>
+      )}
+
+      {/* Origin marker (when user selected an address / origin and route is not yet computed) */}
+      {!route && originCoords && (originCoords.lat !== userLat || originCoords.lng !== userLng) && (
+        <Marker longitude={originCoords.lng} latitude={originCoords.lat} anchor="center">
+          <div style={{
+            width: 22,
+            height: 22,
+            borderRadius: '50%',
+            backgroundColor: '#34A853',
+            border: '2px solid #FFFFFF',
+            boxShadow: '0 2px 6px rgba(0,0,0,0.3)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}>
+            <div style={{ width: 6, height: 6, borderRadius: '50%', backgroundColor: '#FFFFFF' }} />
           </div>
         </Marker>
       )}
@@ -342,8 +452,44 @@ export default function MapView({
                   <div style={{ fontSize: 14, fontWeight: 600, color: '#202124', lineHeight: '1.3' }}>
                     {selectedStation.name}
                   </div>
-                  <div style={{ fontSize: 11, color: '#5F6368', marginTop: 1 }}>
+                  {selectedStation.programName && (
+                    <div style={{
+                      display: 'inline-block',
+                      backgroundColor:
+                        selectedStation.programType === 'grocery'
+                          ? '#F0FDF4'
+                          : selectedStation.programType === 'loyalty'
+                          ? '#FFFBEB'
+                          : '#EFF6FF',
+                      border: `1px solid ${
+                        selectedStation.programType === 'grocery'
+                          ? '#BBF7D0'
+                          : selectedStation.programType === 'loyalty'
+                          ? '#FDE68A'
+                          : '#BFDBFE'
+                      }`,
+                      borderRadius: 4,
+                      padding: '2px 6px',
+                      fontSize: 9,
+                      fontWeight: 700,
+                      color:
+                        selectedStation.programType === 'grocery'
+                          ? '#15803D'
+                          : selectedStation.programType === 'loyalty'
+                          ? '#B45309'
+                          : '#1D4ED8',
+                      marginTop: 3,
+                    }}>
+                      {selectedStation.programName.toUpperCase()}{' '}
+                      {selectedStation.isMembershipRequired ? 'MEMBER PRICING' : 'REWARDS'}
+                      {selectedStation.discountPerGallon
+                        ? ` (SAVE ~$${selectedStation.discountPerGallon.toFixed(2)}/GAL)`
+                        : ''}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 11, color: '#5F6368', marginTop: 2 }}>
                     +{selectedStation.detourMiles.toFixed(1)} mi · +{Math.round(selectedStation.detourMinutes)} min detour
+                    {selectedStation.queueWaitMinutes ? ` (incl. ~${selectedStation.queueWaitMinutes}m line)` : ''}
                   </div>
                 </div>
                 <button
@@ -355,10 +501,15 @@ export default function MapView({
               </div>
 
               {/* Price */}
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 3, marginBottom: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 8 }}>
                 <span style={{ fontSize: 26, fontWeight: 700, color: '#202124', lineHeight: 1 }}>
                   ${selectedStation.pricePerGallon.toFixed(3)}
                 </span>
+                {selectedStation.discountPerGallon && selectedStation.regularPricePerGallon ? (
+                  <span style={{ fontSize: 13, color: '#80868B', textDecoration: 'line-through' }}>
+                    ${selectedStation.regularPricePerGallon.toFixed(3)}
+                  </span>
+                ) : null}
                 <span style={{ fontSize: 12, color: '#5F6368' }}>/gal regular</span>
               </div>
 
@@ -410,6 +561,13 @@ export default function MapView({
                       −${selectedStation.timeCost.toFixed(2)}
                     </span>
                   </div>
+
+                  {selectedStation.queueWaitMinutes ? (
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, color: '#5F6368' }}>
+                      <span>↳ {selectedStation.programName ?? 'Club'} queue wait</span>
+                      <span>~{selectedStation.queueWaitMinutes} min in line</span>
+                    </div>
+                  ) : null}
 
                   <div style={{ height: 1, backgroundColor: '#E8EAED', margin: '2px 0' }} />
 
@@ -563,6 +721,42 @@ export default function MapView({
           </button>
         </div>
 
+        {/* 2D / 3D Perspective Toggle */}
+        <button
+          onClick={toggle3D}
+          title={is3D ? 'Switch to 2D flat view' : 'Switch to 3D perspective view'}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 6,
+            height: 38,
+            boxSizing: 'border-box',
+            backgroundColor: is3D ? '#E8F0FE' : '#FFFFFF',
+            borderRadius: 24,
+            border: is3D ? '1px solid #D2E3FC' : '1px solid rgba(0,0,0,0.08)',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            padding: '0 13px',
+            fontSize: 13,
+            fontWeight: 700,
+            color: is3D ? '#1A73E8' : '#5F6368',
+            cursor: 'pointer',
+            transition: 'all 0.15s ease',
+          }}
+          onMouseEnter={e => {
+            if (!is3D) e.currentTarget.style.backgroundColor = '#F8FAFD';
+          }}
+          onMouseLeave={e => {
+            if (!is3D) e.currentTarget.style.backgroundColor = '#FFFFFF';
+          }}
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={is3D ? '#1A73E8' : '#5F6368'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+            <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+            <line x1="12" y1="22.08" x2="12" y2="12"/>
+          </svg>
+          <span>{is3D ? '3D' : '2D'}</span>
+        </button>
+
         {/* Zoom Controls Pill (+ / −) */}
         <div style={{
           display: 'flex',
@@ -625,12 +819,68 @@ export default function MapView({
           </button>
         </div>
 
+        {/* Center on My Location Button */}
+        <button
+          onClick={() => {
+            if (userLat !== null && userLng !== null) {
+              const map = mapRef.current?.getMap ? mapRef.current.getMap() : mapRef.current;
+              map?.flyTo({
+                center: [userLng, userLat],
+                zoom: 15,
+                pitch: is3D ? 40 : 0,
+                duration: 800,
+                essential: true,
+              });
+            } else if (typeof navigator !== 'undefined' && navigator.geolocation) {
+              navigator.geolocation.getCurrentPosition(
+                pos => {
+                  onUserLocation?.(pos.coords.latitude, pos.coords.longitude);
+                  const map = mapRef.current?.getMap ? mapRef.current.getMap() : mapRef.current;
+                  map?.flyTo({
+                    center: [pos.coords.longitude, pos.coords.latitude],
+                    zoom: 15,
+                    pitch: is3D ? 40 : 0,
+                    duration: 800,
+                    essential: true,
+                  });
+                },
+                err => {
+                  console.warn('[GPS] Center on location failed:', err);
+                },
+                { enableHighAccuracy: true, timeout: 10000 },
+              );
+            }
+          }}
+          title="Center on my location"
+          style={{
+            width: 38,
+            height: 38,
+            boxSizing: 'border-box',
+            backgroundColor: '#FFFFFF',
+            borderRadius: 24,
+            border: '1px solid rgba(0,0,0,0.08)',
+            boxShadow: '0 2px 8px rgba(0,0,0,0.15)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            cursor: 'pointer',
+            transition: 'background-color 0.15s ease',
+          }}
+          onMouseEnter={e => (e.currentTarget.style.backgroundColor = '#F8FAFD')}
+          onMouseLeave={e => (e.currentTarget.style.backgroundColor = '#FFFFFF')}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1A73E8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M12 2v3m0 14v3M2 12h3m14 0h3"/>
+          </svg>
+        </button>
+
         {/* Fit Route Button (shown when route exists) */}
         {route && (
           <button
             onClick={() => {
               const [w, s, e, n] = route.bbox;
-              mapRef.current?.fitBounds([[w, s], [e, n]], { padding: 80, duration: 600 });
+              mapRef.current?.fitBounds([[w, s], [e, n]], { padding: 80, duration: 600, pitch: is3D ? 35 : 0 });
             }}
             title="Fit Route to Screen"
             style={{

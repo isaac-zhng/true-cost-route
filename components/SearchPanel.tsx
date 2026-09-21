@@ -1,10 +1,4 @@
-/**
- * SearchPanel.tsx — Google Maps-inspired search + results panel.
- *
- * Visual language: clean white cards, 8px spacing grid, minimal color (one blue
- * accent), proper typographic hierarchy, no emoji in UI labels.
- */
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -19,6 +13,7 @@ import {
 import { geocode, getRoute, getStationsAlongRoute, fetchAddressSuggestions, type AddressSuggestion } from '../lib/routing';
 import { assignPrices }                             from '../lib/gasApi';
 import { rankStations }                             from '../lib/optimizer';
+import { findProgramsInArea, type DiscoveredProgram, GAS_PROGRAMS } from '../lib/gasPrograms';
 import type { TripInputs, RankedStation }           from '../lib/optimizer';
 import type { RouteResult, LngLat }                 from '../lib/routing';
 
@@ -55,6 +50,8 @@ interface SearchPanelProps {
   onOpenCalculator: () => void;
   userLat?:         number | null;
   userLng?:         number | null;
+  onOriginSelect?:  (coords: LngLat, label: string) => void;
+  onUserLocation?:  (lat: number, lng: number) => void;
 }
 
 const STAGE_LABEL: Record<Stage, string> = {
@@ -95,7 +92,24 @@ function StationCard({
     >
       {isBest && (
         <View style={styles.bestBadge}>
-          <Text style={styles.bestBadgeText}>RECOMMENDED STOP (LOWEST TRUE COST)</Text>
+          <Text style={styles.bestBadgeText}>BEST STOP · LOWEST TRUE COST</Text>
+        </View>
+      )}
+
+      {station.programName && (
+        <View style={[
+          styles.membershipCardBadge,
+          station.programType === 'grocery' && { backgroundColor: '#F0FDF4', borderColor: '#BBF7D0' },
+          station.programType === 'loyalty' && { backgroundColor: '#FFFBEB', borderColor: '#FDE68A' },
+        ]}>
+          <Text style={[
+            styles.membershipCardBadgeText,
+            station.programType === 'grocery' && { color: '#15803D' },
+            station.programType === 'loyalty' && { color: '#B45309' },
+          ]}>
+            {station.programName.toUpperCase()} {station.isMembershipRequired ? 'MEMBER PRICING' : 'REWARDS'}
+            {station.discountPerGallon ? ` (SAVE ~$${station.discountPerGallon.toFixed(2)}/GAL)` : ''}
+          </Text>
         </View>
       )}
 
@@ -105,6 +119,7 @@ function StationCard({
           <Text style={styles.cardName} numberOfLines={1}>{station.name}</Text>
           <Text style={styles.cardMeta}>
             +{station.detourMiles.toFixed(1)} mi · +{Math.round(station.detourMinutes)} min detour
+            {station.queueWaitMinutes ? ` (incl. ~${station.queueWaitMinutes}m line)` : ''}
           </Text>
           {isSelected && (
             <Text style={{ fontSize: 11, color: T.blue, fontWeight: '600', marginTop: 3 }}>
@@ -116,6 +131,11 @@ function StationCard({
         {/* Right: price + savings */}
         <View style={styles.cardRight}>
           <Text style={styles.cardPrice}>${station.pricePerGallon.toFixed(3)}</Text>
+          {station.discountPerGallon && station.regularPricePerGallon ? (
+            <Text style={{ fontSize: 10, color: T.text3, textDecorationLine: 'line-through' }}>
+              ${station.regularPricePerGallon.toFixed(3)}
+            </Text>
+          ) : null}
           <View style={[
             styles.savingsPill,
             { backgroundColor: isWorth ? T.greenBg : T.redBg },
@@ -163,6 +183,17 @@ function StationCard({
             </Text>
           </View>
 
+          {station.queueWaitMinutes ? (
+            <View style={styles.breakdownRow}>
+              <Text style={[styles.breakdownLabel, { color: T.text2 }]}>
+                ↳ {station.programName ?? 'Club'} queue wait
+              </Text>
+              <Text style={[styles.breakdownVal, { color: T.text2 }]}>
+                ~{station.queueWaitMinutes} min in line
+              </Text>
+            </View>
+          ) : null}
+
           <View style={styles.breakdownDivider} />
 
           <View style={styles.breakdownRow}>
@@ -200,6 +231,12 @@ function ParamChip({
   );
 }
 
+const CAR_PRESETS = [
+  { label: 'Sedan (32 MPG)', mpg: '32' },
+  { label: 'SUV (22 MPG)', mpg: '22' },
+  { label: 'Hybrid (48 MPG)', mpg: '48' },
+] as const;
+
 // ─── Main panel ───────────────────────────────────────────────────────────────
 export default function SearchPanel({
   onRouteFound,
@@ -210,6 +247,8 @@ export default function SearchPanel({
   onOpenCalculator,
   userLat = null,
   userLng = null,
+  onOriginSelect,
+  onUserLocation,
 }: SearchPanelProps) {
   const [origin,            setOrigin]            = useState('');
   const [destination,       setDestination]       = useState('');
@@ -220,13 +259,101 @@ export default function SearchPanel({
   const [activeField,       setActiveField]       = useState<'origin' | 'destination' | null>(null);
   const [suggestions,       setSuggestions]       = useState<AddressSuggestion[]>([]);
   const [isSuggesting,      setIsSuggesting]      = useState(false);
+  const [isLocating,        setIsLocating]        = useState(false);
   const debounceTimerRef                          = useRef<any>(null);
 
   const [mpg,         setMpg]         = useState('25');
   const [gallons,     setGallons]     = useState('12');
   const [hourlyValue, setHourlyValue] = useState('25');
+  const [ignoreTime,  setIgnoreTime]  = useState(false);
+  const [enrolledProgramIds, setEnrolledProgramIds] = useState<string[]>(['costco', 'sams_club']);
+  const [discoveredPrograms, setDiscoveredPrograms] = useState<DiscoveredProgram[]>([]);
+  const [isScanningArea,     setIsScanningArea]     = useState(false);
+  const [showAllPrograms,    setShowAllPrograms]    = useState(false);
   const [stage,       setStage]       = useState<Stage>('idle');
   const [errorMsg,    setErrorMsg]    = useState('');
+
+  const rawStationsRef       = useRef<any[]>([]);
+  const rawPricedStationsRef = useRef<any[]>([]);
+
+  // Scan 20-mile radius for all gas discount / membership programs when user coordinates are available
+  useEffect(() => {
+    if (userLat === null || userLng === null) return;
+    let active = true;
+    setIsScanningArea(true);
+    findProgramsInArea(userLat, userLng)
+      .then(progs => {
+        if (active) {
+          setDiscoveredPrograms(progs);
+          setIsScanningArea(false);
+        }
+      })
+      .catch(err => {
+        console.warn('Area programs scan failed:', err);
+        if (active) setIsScanningArea(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [userLat, userLng]);
+
+  const handleSwap = () => {
+    const prevOrigin = origin;
+    const prevCoords = originCoords;
+    setOrigin(destination);
+    setOriginCoords(destinationCoords);
+    setDestination(prevOrigin);
+    setDestinationCoords(prevCoords);
+    setSuggestions([]);
+    setActiveField(null);
+  };
+
+  const handleToggleIgnoreTime = () => {
+    const next = !ignoreTime;
+    setIgnoreTime(next);
+    setHourlyValue(next ? '0' : '25');
+    if (rawPricedStationsRef.current.length > 0) {
+      const inputs: TripInputs = {
+        mpg:             parseFloat(mpg)         || 25,
+        gallons:         parseFloat(gallons)      || 12,
+        hourlyTimeValue: next ? 0 : 25,
+        enrolledProgramIds,
+      };
+      onStationsFound(rankStations(rawPricedStationsRef.current, inputs));
+    }
+  };
+
+  const toggleProgram = async (progId: string) => {
+    const next = enrolledProgramIds.includes(progId)
+      ? enrolledProgramIds.filter(p => p !== progId)
+      : [...enrolledProgramIds, progId];
+    setEnrolledProgramIds(next);
+
+    if (rawStationsRef.current.length > 0) {
+      const priced = await assignPrices(rawStationsRef.current, next);
+      rawPricedStationsRef.current = priced;
+      const inputs: TripInputs = {
+        mpg:             parseFloat(mpg)         || 25,
+        gallons:         parseFloat(gallons)      || 12,
+        hourlyTimeValue: ignoreTime ? 0 : (parseFloat(hourlyValue) || 25),
+        enrolledProgramIds: next,
+      };
+      onStationsFound(rankStations(priced, inputs));
+    }
+  };
+
+  // Discovered programs in user's area, plus any other enrolled programs, or fallback to GAS_PROGRAMS
+  const programsToDisplay = React.useMemo(() => {
+    if (discoveredPrograms.length > 0) {
+      if (showAllPrograms) {
+        const discoveredIds = new Set(discoveredPrograms.map(p => p.id));
+        const remaining = GAS_PROGRAMS.filter(p => !discoveredIds.has(p.id));
+        return [...discoveredPrograms, ...remaining];
+      }
+      return discoveredPrograms;
+    }
+    return showAllPrograms ? GAS_PROGRAMS : GAS_PROGRAMS.slice(0, 6);
+  }, [discoveredPrograms, showAllPrograms]);
 
   const isLoading = stage !== 'idle' && stage !== 'done' && stage !== 'error';
   const isDone    = stage === 'done';
@@ -271,6 +398,7 @@ export default function SearchPanel({
     if (activeField === 'origin') {
       setOrigin(s.fullText);
       setOriginCoords(s.coords);
+      onOriginSelect?.(s.coords, s.fullText);
     } else if (activeField === 'destination') {
       setDestination(s.fullText);
       setDestinationCoords(s.coords);
@@ -279,13 +407,47 @@ export default function SearchPanel({
     setActiveField(null);
   };
 
-  const handleUseCurrentLocation = () => {
-    if (userLat === null || userLng === null) return;
-    setOrigin('Your current location');
-    setOriginCoords({ lat: userLat, lng: userLng });
-    setSuggestions([]);
-    setActiveField(null);
-  };
+  const handleUseCurrentLocation = useCallback(() => {
+    if (userLat !== null && userLng !== null) {
+      setOrigin('Your current location');
+      const coords: LngLat = { lat: userLat, lng: userLng };
+      setOriginCoords(coords);
+      onOriginSelect?.(coords, 'Your current location');
+      setSuggestions([]);
+      setActiveField(null);
+      return;
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      setIsLocating(true);
+      navigator.geolocation.getCurrentPosition(
+        pos => {
+          setIsLocating(false);
+          const coords: LngLat = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          setOrigin('Your current location');
+          setOriginCoords(coords);
+          onUserLocation?.(coords.lat, coords.lng);
+          onOriginSelect?.(coords, 'Your current location');
+          setSuggestions([]);
+          setActiveField(null);
+        },
+        err => {
+          setIsLocating(false);
+          console.warn('[GPS] Failed to get current location:', err);
+          setErrorMsg(
+            err.code === 1
+              ? 'Location permission was denied in your browser settings.'
+              : 'Unable to detect your location. Please type your starting address.',
+          );
+          setStage('error');
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 },
+      );
+    } else {
+      setErrorMsg('Geolocation is not supported by your browser.');
+      setStage('error');
+    }
+  }, [userLat, userLng, onOriginSelect, onUserLocation]);
 
   const handleSearch = useCallback(async () => {
     if (!origin.trim() || !destination.trim()) {
@@ -314,15 +476,18 @@ export default function SearchPanel({
       setStage('fetching_stations');
       const raw = await getStationsAlongRoute(route.geometry);
       if (!raw.length) throw new Error('No gas stations found within 5 miles of this route.');
+      rawStationsRef.current = raw;
 
       setStage('fetching_prices');
-      const priced = await assignPrices(raw);
+      const priced = await assignPrices(raw, enrolledProgramIds);
+      rawPricedStationsRef.current = priced;
 
       setStage('ranking');
       const inputs: TripInputs = {
         mpg:             parseFloat(mpg)         || 25,
         gallons:         parseFloat(gallons)      || 12,
-        hourlyTimeValue: parseFloat(hourlyValue)  || 25,
+        hourlyTimeValue: ignoreTime ? 0 : (parseFloat(hourlyValue) || 25),
+        enrolledProgramIds,
       };
       onStationsFound(rankStations(priced, inputs));
       setStage('done');
@@ -330,7 +495,7 @@ export default function SearchPanel({
       setErrorMsg(err instanceof Error ? err.message : 'An unexpected error occurred.');
       setStage('error');
     }
-  }, [origin, destination, originCoords, destinationCoords, mpg, gallons, hourlyValue, onRouteFound, onStationsFound]);
+  }, [origin, destination, originCoords, destinationCoords, mpg, gallons, hourlyValue, ignoreTime, enrolledProgramIds, onRouteFound, onStationsFound]);
 
   return (
     <View style={styles.panel}>
@@ -378,7 +543,21 @@ export default function SearchPanel({
               returnKeyType="next"
               editable={!isLoading}
             />
-            {origin.length > 0 && (
+            {isLocating ? (
+              <ActivityIndicator size="small" color={T.blue} style={{ marginRight: 6 }} />
+            ) : origin.length === 0 ? (
+              <TouchableOpacity
+                onPress={handleUseCurrentLocation}
+                style={styles.locateInputBtn}
+                accessibilityLabel="Use current location"
+                activeOpacity={0.7}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke={T.blue} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
+                </svg>
+              </TouchableOpacity>
+            ) : (
               <TouchableOpacity
                 onPress={() => {
                   setOrigin('');
@@ -396,21 +575,25 @@ export default function SearchPanel({
           {/* Origin suggestions dropdown */}
           {activeField === 'origin' && (
             <View style={styles.dropdown}>
-              {userLat !== null && userLng !== null && (
-                <TouchableOpacity
-                  style={styles.dropdownItem}
-                  onPress={handleUseCurrentLocation}
-                  activeOpacity={0.7}
-                >
-                  <View style={[styles.dropdownIconWrap, { backgroundColor: T.blueBg }]}>
-                    <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: T.blue }} />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={[styles.dropdownPrimary, { color: T.blue }]}>Your current location</Text>
-                    <Text style={styles.dropdownSecondary}>Use GPS coordinates</Text>
-                  </View>
-                </TouchableOpacity>
-              )}
+              <TouchableOpacity
+                style={styles.dropdownItem}
+                onPress={handleUseCurrentLocation}
+                activeOpacity={0.7}
+              >
+                <View style={[styles.dropdownIconWrap, { backgroundColor: T.blueBg }]}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={T.blue} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="3" />
+                    <path d="M12 2v3m0 14v3M2 12h3m14 0h3" />
+                  </svg>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.dropdownPrimary, { color: T.blue }]}>Your current location</Text>
+                  <Text style={styles.dropdownSecondary}>
+                    {isLocating ? 'Detecting GPS coordinates…' : 'Use GPS coordinates'}
+                  </Text>
+                </View>
+                {isLocating && <ActivityIndicator size="small" color={T.blue} />}
+              </TouchableOpacity>
 
               {isSuggesting && (
                 <View style={styles.dropdownLoading}>
@@ -446,9 +629,19 @@ export default function SearchPanel({
             </View>
           )}
 
-          {/* Connecting line */}
+          {/* Connecting line + Swap button */}
           <View style={styles.routeConnector}>
             <View style={styles.connectorLine} />
+            <TouchableOpacity
+              onPress={handleSwap}
+              style={styles.swapBtn}
+              accessibilityLabel="Reverse start and destination"
+              activeOpacity={0.7}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={T.text2} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M7 16V4m0 0L3 8m4-4l4 4m6 4v12m0 0l4-4m-4 4l-4-4"/>
+              </svg>
+            </TouchableOpacity>
           </View>
 
           {/* Destination input row */}
@@ -523,6 +716,95 @@ export default function SearchPanel({
           )}
         </View>
 
+        {/* ── Vehicle & Commute Presets ── */}
+        <View style={styles.presetsRow}>
+          {CAR_PRESETS.map(car => {
+            const isActive = mpg === car.mpg;
+            return (
+              <TouchableOpacity
+                key={car.label}
+                onPress={() => setMpg(car.mpg)}
+                style={[styles.presetChip, isActive && styles.presetChipActive]}
+                activeOpacity={0.7}
+              >
+                <Text style={[styles.presetChipText, isActive && styles.presetChipTextActive]}>
+                  {car.label}
+                </Text>
+              </TouchableOpacity>
+            );
+          })}
+          <TouchableOpacity
+            onPress={handleToggleIgnoreTime}
+            style={[styles.presetChip, ignoreTime && styles.presetChipTimeActive]}
+            activeOpacity={0.7}
+          >
+            <Text style={[styles.presetChipText, ignoreTime && styles.presetChipTimeTextActive]}>
+              {ignoreTime ? '✓ Free time ($0)' : 'Time: $25/hr'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* ── Discounts & Memberships in Area ── */}
+        <View style={styles.programsSection}>
+          <View style={styles.programsHeaderRow}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.programsTitle}>DISCOUNTS & MEMBERSHIPS IN YOUR AREA</Text>
+              <Text style={styles.programsSubtitle}>
+                {isScanningArea
+                  ? 'Scanning 20 mi for local clubs & grocery rewards…'
+                  : discoveredPrograms.length > 0
+                  ? `Found ${discoveredPrograms.length} programs with stations near you`
+                  : 'Select your programs for personalized pricing'}
+              </Text>
+            </View>
+            {isScanningArea && (
+              <ActivityIndicator size="small" color={T.blue} style={{ marginLeft: 6 }} />
+            )}
+          </View>
+
+          <View style={styles.programsList}>
+            {programsToDisplay.map(prog => {
+              const isEnrolled = enrolledProgramIds.includes(prog.id);
+              const dist = 'distanceMiles' in prog && (prog as DiscoveredProgram).distanceMiles > 0
+                ? `${(prog as DiscoveredProgram).distanceMiles} mi`
+                : null;
+              return (
+                <TouchableOpacity
+                  key={prog.id}
+                  onPress={() => toggleProgram(prog.id)}
+                  style={[
+                    styles.programPill,
+                    isEnrolled && styles.programPillActive,
+                    isEnrolled && prog.type === 'grocery' && styles.programPillActiveGrocery,
+                    isEnrolled && prog.type === 'loyalty' && styles.programPillActiveLoyalty,
+                  ]}
+                  activeOpacity={0.7}
+                >
+                  <Text style={[
+                    styles.programPillText,
+                    isEnrolled && styles.programPillTextActive,
+                    isEnrolled && prog.type === 'grocery' && { color: '#15803D' },
+                    isEnrolled && prog.type === 'loyalty' && { color: '#B45309' },
+                  ]}>
+                    {isEnrolled ? `✓ ${prog.badgeLabel}` : `+ ${prog.badgeLabel}`}
+                    {dist ? ` (${dist})` : ''}
+                  </Text>
+                </TouchableOpacity>
+              );
+            })}
+
+            <TouchableOpacity
+              onPress={() => setShowAllPrograms(prev => !prev)}
+              style={styles.moreProgramsBtn}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.moreProgramsBtnText}>
+                {showAllPrograms ? 'Show fewer' : '+ More programs'}
+              </Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
         {/* ── Vehicle params ── */}
         <View style={styles.chipsRow}>
           <ParamChip label="MPG"      value={mpg}         onChangeText={setMpg} />
@@ -562,23 +844,20 @@ export default function SearchPanel({
             {/* Guide Explainer Banner */}
             <View style={styles.guideBanner}>
               <View style={styles.guideHeader}>
-                <Text style={styles.guideTitle}>How True Cost Ranking Works</Text>
+                <Text style={styles.guideTitle}>The Detour Math</Text>
               </View>
               <Text style={styles.guideText}>
-                We calculate if a gas detour is truly worth it by balancing{' '}
-                <Text style={{ fontWeight: '700' }}>Gas Price</Text>,{' '}
-                <Text style={{ fontWeight: '700' }}>Detour Distance</Text>, and{' '}
-                <Text style={{ fontWeight: '700' }}>Your Time</Text>:
+                We balance pump price, extra fuel burned (+mi), and your time (+min) to calculate your true net savings:
               </Text>
               <View style={styles.guidePillsRow}>
                 <View style={[styles.guidePill, { backgroundColor: T.greenBg }]}>
                   <Text style={[styles.guidePillText, { color: T.green }]}>
-                    Save: Real profit in your pocket
+                    Save: Real money in your pocket
                   </Text>
                 </View>
                 <View style={[styles.guidePill, { backgroundColor: T.redBg }]}>
                   <Text style={[styles.guidePillText, { color: T.red }]}>
-                    Lose: Detour costs more than gas savings
+                    Lose: Detour costs extra
                   </Text>
                 </View>
               </View>
@@ -609,7 +888,14 @@ export default function SearchPanel({
           </Text>
         )}
 
-        <View style={{ height: 24 }} />
+        {/* Footer signature */}
+        <View style={styles.panelFooter}>
+          <Text style={styles.panelFooterText}>
+            Built by Isaac · Free & client-side · Real EIA gas prices
+          </Text>
+        </View>
+
+        <View style={{ height: 16 }} />
       </ScrollView>
     </View>
   );
@@ -702,13 +988,134 @@ const styles = StyleSheet.create({
     ...(Platform.OS === 'web' ? ({ outlineStyle: 'none' } as object) : {}),
   },
   routeConnector: {
-    paddingLeft: 22,
-    height: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingLeft: 34,
+    paddingRight: 12,
+    height: 20,
   },
   connectorLine: {
+    flex: 1,
     height: 1,
     backgroundColor: T.border,
-    marginLeft: 12,
+  },
+  swapBtn: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: T.surface,
+    borderWidth: 1,
+    borderColor: T.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginLeft: 8,
+  },
+
+  // Vehicle & Commute presets
+  presetsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginBottom: 10,
+  },
+  presetChip: {
+    paddingVertical: 5,
+    paddingHorizontal: 9,
+    borderRadius: 14,
+    backgroundColor: T.surface,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  presetChipActive: {
+    backgroundColor: T.blueBg,
+    borderColor: T.blue,
+  },
+  presetChipText: {
+    fontSize: 11,
+    fontWeight: '500',
+    color: T.text2,
+  },
+  presetChipTextActive: {
+    color: T.blue,
+    fontWeight: '700',
+  },
+  presetChipTimeActive: {
+    backgroundColor: T.goldBg,
+    borderColor: T.gold,
+  },
+  presetChipTimeTextActive: {
+    color: T.gold,
+    fontWeight: '700',
+  },
+
+  // Discounts & Memberships in Area
+  programsSection: {
+    marginBottom: 14,
+  },
+  programsHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  programsTitle: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: T.text2,
+    letterSpacing: 0.5,
+  },
+  programsSubtitle: {
+    fontSize: 11,
+    color: T.text3,
+    marginTop: 1,
+  },
+  programsList: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  programPill: {
+    paddingVertical: 5,
+    paddingHorizontal: 9,
+    borderRadius: 12,
+    backgroundColor: T.surface,
+    borderWidth: 1,
+    borderColor: T.border,
+  },
+  programPillActive: {
+    backgroundColor: '#EFF6FF',
+    borderColor: '#93C5FD',
+  },
+  programPillActiveGrocery: {
+    backgroundColor: '#F0FDF4',
+    borderColor: '#86EFAC',
+  },
+  programPillActiveLoyalty: {
+    backgroundColor: '#FFFBEB',
+    borderColor: '#FDE68A',
+  },
+  programPillText: {
+    fontSize: 11,
+    fontWeight: '500',
+    color: T.text2,
+  },
+  programPillTextActive: {
+    color: '#1D4ED8',
+    fontWeight: '700',
+  },
+  moreProgramsBtn: {
+    paddingVertical: 5,
+    paddingHorizontal: 9,
+    borderRadius: 12,
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: T.border,
+    justifyContent: 'center',
+  },
+  moreProgramsBtnText: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: T.text3,
   },
 
   // Vehicle param chips
@@ -831,6 +1238,22 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: '700',
     color: T.gold,
+    letterSpacing: 0.5,
+  },
+  membershipCardBadge: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#EFF6FF',
+    borderRadius: 4,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    marginBottom: 8,
+    borderWidth: 1,
+    borderColor: '#BFDBFE',
+  },
+  membershipCardBadgeText: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: '#1D4ED8',
     letterSpacing: 0.5,
   },
   cardRow: {
@@ -975,6 +1398,12 @@ const styles = StyleSheet.create({
     color: T.text3,
     fontWeight: '600',
   },
+  locateInputBtn: {
+    padding: 4,
+    marginLeft: 6,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
 
   // Address suggestions dropdown
   dropdown: {
@@ -1031,5 +1460,19 @@ const styles = StyleSheet.create({
     fontSize: 12,
     color: T.text3,
     fontStyle: 'italic',
+  },
+
+  // Panel footer signature
+  panelFooter: {
+    marginTop: 16,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: T.border,
+    alignItems: 'center',
+  },
+  panelFooterText: {
+    fontSize: 11,
+    color: T.text3,
+    letterSpacing: 0.2,
   },
 });

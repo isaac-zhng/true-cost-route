@@ -1,19 +1,30 @@
 import { EIA_API_KEY } from '../constants/config';
+import { type ProgramType, GAS_PROGRAMS } from './gasPrograms';
 
-// ─── Types ────────────────────────────────────────────────────────────────────
 export interface GasStation {
   id: string;
   name: string;
   lat: number;
   lng: number;
-  /** Price in $/gal for regular unleaded */
+  /** Final calculated price in $/gal for regular unleaded */
   pricePerGallon: number;
+  /** Non-discounted base price in $/gal */
+  regularPricePerGallon?: number;
   /** State abbreviation e.g. "CA" */
   state: string;
   /** Estimated detour distance in miles from the direct route */
   detourMiles: number;
-  /** Estimated detour time in minutes */
+  /** Estimated detour time in minutes (including queue wait time if any) */
   detourMinutes: number;
+  /** True if station requires a club membership to pump */
+  isMembershipRequired?: boolean;
+  /** Program information if affiliated with wholesale/grocery/loyalty */
+  programId?: string;
+  programName?: string;
+  programType?: ProgramType;
+  discountPerGallon?: number;
+  /** Estimated queue wait time in minutes (e.g. 6 min for Costco/Sam's) */
+  queueWaitMinutes?: number;
 }
 
 // ─── EIA Series IDs for regular gasoline by state ────────────────────────────
@@ -107,16 +118,49 @@ export async function fetchStatePricePerGallon(state: string): Promise<number> {
  */
 export async function assignPrices(
   stations: Omit<GasStation, 'pricePerGallon'>[],
+  enrolledProgramIds: string[] = [],
 ): Promise<GasStation[]> {
   const uniqueStates = [...new Set(stations.map(s => s.state))];
   const prices = await Promise.all(uniqueStates.map(st => fetchStatePricePerGallon(st)));
   const stateMap: Record<string, number> = {};
   uniqueStates.forEach((st, i) => (stateMap[st] = prices[i]));
 
-  return stations.map(s => ({
-    ...s,
-    // Add ±5 cent variation to simulate station-level differences
-    pricePerGallon: +(stateMap[s.state] + (Math.random() - 0.5) * 0.1).toFixed(3),
-  }));
+  return stations.map(s => {
+    const basePrice = stateMap[s.state] ?? 3.5;
+    const jitter = (Math.random() - 0.5) * 0.08; // ±4¢ local variance
+    const regularPrice = +Math.max(1.5, basePrice + jitter).toFixed(3);
+
+    let pricePerGallon = regularPrice;
+    let appliedDiscount = 0;
+
+    if (s.programId) {
+      const prog = GAS_PROGRAMS.find(p => p.id === s.programId);
+      const isEnrolled = enrolledProgramIds.includes(s.programId);
+
+      if (prog) {
+        if (prog.type === 'wholesale') {
+          // Wholesale club pricing is always lower, but requires membership
+          appliedDiscount = +(prog.typicalDiscount + (Math.random() - 0.5) * 0.04).toFixed(3);
+          pricePerGallon = +(regularPrice - appliedDiscount).toFixed(3);
+        } else if (isEnrolled) {
+          // Grocery & Loyalty discount applies if user is enrolled
+          appliedDiscount = +(prog.typicalDiscount + (Math.random() - 0.5) * 0.02).toFixed(3);
+          pricePerGallon = +(regularPrice - appliedDiscount).toFixed(3);
+        }
+      }
+    }
+
+    const queueWait = s.queueWaitMinutes ?? 0;
+    const detourMinutes = +(s.detourMinutes + queueWait).toFixed(1);
+
+    return {
+      ...s,
+      pricePerGallon,
+      regularPricePerGallon: regularPrice,
+      discountPerGallon: appliedDiscount > 0 ? appliedDiscount : undefined,
+      detourMinutes,
+      queueWaitMinutes: queueWait > 0 ? queueWait : undefined,
+    };
+  });
 }
 
