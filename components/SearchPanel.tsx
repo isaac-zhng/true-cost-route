@@ -13,9 +13,9 @@ import {
 import { geocode, getRoute, getStationsAlongRoute, fetchAddressSuggestions, type AddressSuggestion } from '../lib/routing';
 import { assignPrices }                             from '../lib/gasApi';
 import { rankStations }                             from '../lib/optimizer';
-import { findProgramsInArea, type DiscoveredProgram, GAS_PROGRAMS } from '../lib/gasPrograms';
 import type { TripInputs, RankedStation }           from '../lib/optimizer';
 import type { RouteResult, LngLat }                 from '../lib/routing';
+import type { UserPreferences }                     from '../screens/SettingsScreen';
 
 // ─── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -42,16 +42,19 @@ type Stage =
   | 'done' | 'error';
 
 interface SearchPanelProps {
-  onRouteFound:     (r: RouteResult, o: LngLat, d: LngLat) => void;
-  onStationsFound:  (s: RankedStation[]) => void;
-  onSelectStation:  (s: RankedStation | null) => void;
-  selectedStation:  RankedStation | null;
-  stations:         RankedStation[];
-  onOpenCalculator: () => void;
-  userLat?:         number | null;
-  userLng?:         number | null;
-  onOriginSelect?:  (coords: LngLat, label: string) => void;
-  onUserLocation?:  (lat: number, lng: number) => void;
+  onRouteFound:         (r: RouteResult, o: LngLat, d: LngLat) => void;
+  onStationsFound:      (s: RankedStation[]) => void;
+  onSelectStation:      (s: RankedStation | null) => void;
+  selectedStation:      RankedStation | null;
+  stations:             RankedStation[];
+  onOpenCalculator:     () => void;
+  onOpenSettings:       () => void;
+  onUpdatePreferences?: (prefs: UserPreferences) => void;
+  preferences?:         UserPreferences;
+  userLat?:             number | null;
+  userLng?:             number | null;
+  onOriginSelect?:      (coords: LngLat, label: string) => void;
+  onUserLocation?:      (lat: number, lng: number) => void;
 }
 
 const STAGE_LABEL: Record<Stage, string> = {
@@ -210,33 +213,6 @@ function StationCard({
   );
 }
 
-// ─── Inline stepper for vehicle params ───────────────────────────────────────
-function ParamChip({
-  label, value, onChangeText,
-}: {
-  label: string; value: string; onChangeText: (v: string) => void;
-}) {
-  return (
-    <View style={styles.chip}>
-      <Text style={styles.chipLabel}>{label}</Text>
-      <TextInput
-        style={styles.chipInput}
-        value={value}
-        onChangeText={onChangeText}
-        keyboardType="decimal-pad"
-        selectTextOnFocus
-        returnKeyType="done"
-      />
-    </View>
-  );
-}
-
-const CAR_PRESETS = [
-  { label: 'Sedan (32 MPG)', mpg: '32' },
-  { label: 'SUV (22 MPG)', mpg: '22' },
-  { label: 'Hybrid (48 MPG)', mpg: '48' },
-] as const;
-
 // ─── Main panel ───────────────────────────────────────────────────────────────
 export default function SearchPanel({
   onRouteFound,
@@ -245,6 +221,8 @@ export default function SearchPanel({
   selectedStation,
   stations,
   onOpenCalculator,
+  onOpenSettings,
+  preferences,
   userLat = null,
   userLng = null,
   onOriginSelect,
@@ -262,40 +240,42 @@ export default function SearchPanel({
   const [isLocating,        setIsLocating]        = useState(false);
   const debounceTimerRef                          = useRef<any>(null);
 
-  const [mpg,         setMpg]         = useState('25');
-  const [gallons,     setGallons]     = useState('12');
-  const [hourlyValue, setHourlyValue] = useState('25');
-  const [ignoreTime,  setIgnoreTime]  = useState(false);
-  const [enrolledProgramIds, setEnrolledProgramIds] = useState<string[]>(['costco', 'sams_club']);
-  const [discoveredPrograms, setDiscoveredPrograms] = useState<DiscoveredProgram[]>([]);
-  const [isScanningArea,     setIsScanningArea]     = useState(false);
-  const [showAllPrograms,    setShowAllPrograms]    = useState(false);
+  const [mpg,         setMpg]         = useState(preferences ? String(preferences.mpg) : '25');
+  const [gallons,     setGallons]     = useState(preferences ? String(preferences.gallons) : '12');
+  const [hourlyValue, setHourlyValue] = useState(preferences ? String(preferences.hourlyValue) : '25');
+  const [ignoreTime,  setIgnoreTime]  = useState(preferences ? preferences.ignoreTime : false);
+  const [enrolledProgramIds, setEnrolledProgramIds] = useState<string[]>(
+    preferences ? preferences.enrolledProgramIds : ['costco', 'sams_club']
+  );
   const [stage,       setStage]       = useState<Stage>('idle');
   const [errorMsg,    setErrorMsg]    = useState('');
 
   const rawStationsRef       = useRef<any[]>([]);
   const rawPricedStationsRef = useRef<any[]>([]);
 
-  // Scan 20-mile radius for all gas discount / membership programs when user coordinates are available
+  // Keep vehicle & program settings in sync with user preferences saved in SettingsScreen
   useEffect(() => {
-    if (userLat === null || userLng === null) return;
-    let active = true;
-    setIsScanningArea(true);
-    findProgramsInArea(userLat, userLng)
-      .then(progs => {
-        if (active) {
-          setDiscoveredPrograms(progs);
-          setIsScanningArea(false);
-        }
-      })
-      .catch(err => {
-        console.warn('Area programs scan failed:', err);
-        if (active) setIsScanningArea(false);
+    if (!preferences) return;
+    setMpg(String(preferences.mpg));
+    setGallons(String(preferences.gallons));
+    setHourlyValue(String(preferences.hourlyValue));
+    setIgnoreTime(preferences.ignoreTime);
+    setEnrolledProgramIds(preferences.enrolledProgramIds);
+
+    // If stations were already fetched, re-price and re-rank immediately
+    if (rawStationsRef.current.length > 0) {
+      assignPrices(rawStationsRef.current, preferences.enrolledProgramIds).then(priced => {
+        rawPricedStationsRef.current = priced;
+        const inputs: TripInputs = {
+          mpg: preferences.mpg,
+          gallons: preferences.gallons,
+          hourlyTimeValue: preferences.ignoreTime ? 0 : preferences.hourlyValue,
+          enrolledProgramIds: preferences.enrolledProgramIds,
+        };
+        onStationsFound(rankStations(priced, inputs));
       });
-    return () => {
-      active = false;
-    };
-  }, [userLat, userLng]);
+    }
+  }, [preferences, onStationsFound]);
 
   const handleSwap = () => {
     const prevOrigin = origin;
@@ -307,53 +287,6 @@ export default function SearchPanel({
     setSuggestions([]);
     setActiveField(null);
   };
-
-  const handleToggleIgnoreTime = () => {
-    const next = !ignoreTime;
-    setIgnoreTime(next);
-    setHourlyValue(next ? '0' : '25');
-    if (rawPricedStationsRef.current.length > 0) {
-      const inputs: TripInputs = {
-        mpg:             parseFloat(mpg)         || 25,
-        gallons:         parseFloat(gallons)      || 12,
-        hourlyTimeValue: next ? 0 : 25,
-        enrolledProgramIds,
-      };
-      onStationsFound(rankStations(rawPricedStationsRef.current, inputs));
-    }
-  };
-
-  const toggleProgram = async (progId: string) => {
-    const next = enrolledProgramIds.includes(progId)
-      ? enrolledProgramIds.filter(p => p !== progId)
-      : [...enrolledProgramIds, progId];
-    setEnrolledProgramIds(next);
-
-    if (rawStationsRef.current.length > 0) {
-      const priced = await assignPrices(rawStationsRef.current, next);
-      rawPricedStationsRef.current = priced;
-      const inputs: TripInputs = {
-        mpg:             parseFloat(mpg)         || 25,
-        gallons:         parseFloat(gallons)      || 12,
-        hourlyTimeValue: ignoreTime ? 0 : (parseFloat(hourlyValue) || 25),
-        enrolledProgramIds: next,
-      };
-      onStationsFound(rankStations(priced, inputs));
-    }
-  };
-
-  // Discovered programs in user's area, plus any other enrolled programs, or fallback to GAS_PROGRAMS
-  const programsToDisplay = React.useMemo(() => {
-    if (discoveredPrograms.length > 0) {
-      if (showAllPrograms) {
-        const discoveredIds = new Set(discoveredPrograms.map(p => p.id));
-        const remaining = GAS_PROGRAMS.filter(p => !discoveredIds.has(p.id));
-        return [...discoveredPrograms, ...remaining];
-      }
-      return discoveredPrograms;
-    }
-    return showAllPrograms ? GAS_PROGRAMS : GAS_PROGRAMS.slice(0, 6);
-  }, [discoveredPrograms, showAllPrograms]);
 
   const isLoading = stage !== 'idle' && stage !== 'done' && stage !== 'error';
   const isDone    = stage === 'done';
@@ -506,13 +439,27 @@ export default function SearchPanel({
           <Text style={styles.appName}>True Cost Route</Text>
           <Text style={styles.appTagline}>Find the cheapest gas along your drive</Text>
         </View>
-        <TouchableOpacity
-          onPress={onOpenCalculator}
-          style={styles.iconBtn}
-          activeOpacity={0.7}
-        >
-          <Text style={styles.iconBtnText}>⌗</Text>
-        </TouchableOpacity>
+        <View style={styles.headerActions}>
+          <TouchableOpacity
+            onPress={onOpenCalculator}
+            style={styles.iconBtn}
+            accessibilityLabel="Open calculator"
+            activeOpacity={0.7}
+          >
+            <Text style={styles.iconBtnText}>⌗</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            onPress={onOpenSettings}
+            style={styles.iconBtn}
+            accessibilityLabel="Open vehicle & membership settings"
+            activeOpacity={0.7}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke={T.text2} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <ScrollView
@@ -716,101 +663,25 @@ export default function SearchPanel({
           )}
         </View>
 
-        {/* ── Vehicle & Commute Presets ── */}
-        <View style={styles.presetsRow}>
-          {CAR_PRESETS.map(car => {
-            const isActive = mpg === car.mpg;
-            return (
-              <TouchableOpacity
-                key={car.label}
-                onPress={() => setMpg(car.mpg)}
-                style={[styles.presetChip, isActive && styles.presetChipActive]}
-                activeOpacity={0.7}
-              >
-                <Text style={[styles.presetChipText, isActive && styles.presetChipTextActive]}>
-                  {car.label}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
-          <TouchableOpacity
-            onPress={handleToggleIgnoreTime}
-            style={[styles.presetChip, ignoreTime && styles.presetChipTimeActive]}
-            activeOpacity={0.7}
-          >
-            <Text style={[styles.presetChipText, ignoreTime && styles.presetChipTimeTextActive]}>
-              {ignoreTime ? '✓ Free time ($0)' : 'Time: $25/hr'}
-            </Text>
-          </TouchableOpacity>
-        </View>
-
-        {/* ── Discounts & Memberships in Area ── */}
-        <View style={styles.programsSection}>
-          <View style={styles.programsHeaderRow}>
-            <View style={{ flex: 1 }}>
-              <Text style={styles.programsTitle}>DISCOUNTS & MEMBERSHIPS IN YOUR AREA</Text>
-              <Text style={styles.programsSubtitle}>
-                {isScanningArea
-                  ? 'Scanning 20 mi for local clubs & grocery rewards…'
-                  : discoveredPrograms.length > 0
-                  ? `Found ${discoveredPrograms.length} programs with stations near you`
-                  : 'Select your programs for personalized pricing'}
-              </Text>
+        {/* ── Quick Preferences Summary Bar ── */}
+        <TouchableOpacity
+          style={styles.prefsBanner}
+          onPress={onOpenSettings}
+          activeOpacity={0.7}
+        >
+          <View style={styles.prefsBannerLeft}>
+            <View style={styles.prefsGearIcon}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={T.text2} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
             </View>
-            {isScanningArea && (
-              <ActivityIndicator size="small" color={T.blue} style={{ marginLeft: 6 }} />
-            )}
+            <Text style={styles.prefsBannerText} numberOfLines={1}>
+              {mpg} MPG · {ignoreTime ? '$0/hr (Free time)' : `$${hourlyValue}/hr`} · {enrolledProgramIds.length} {enrolledProgramIds.length === 1 ? 'Program' : 'Programs'}
+            </Text>
           </View>
-
-          <View style={styles.programsList}>
-            {programsToDisplay.map(prog => {
-              const isEnrolled = enrolledProgramIds.includes(prog.id);
-              const dist = 'distanceMiles' in prog && (prog as DiscoveredProgram).distanceMiles > 0
-                ? `${(prog as DiscoveredProgram).distanceMiles} mi`
-                : null;
-              return (
-                <TouchableOpacity
-                  key={prog.id}
-                  onPress={() => toggleProgram(prog.id)}
-                  style={[
-                    styles.programPill,
-                    isEnrolled && styles.programPillActive,
-                    isEnrolled && prog.type === 'grocery' && styles.programPillActiveGrocery,
-                    isEnrolled && prog.type === 'loyalty' && styles.programPillActiveLoyalty,
-                  ]}
-                  activeOpacity={0.7}
-                >
-                  <Text style={[
-                    styles.programPillText,
-                    isEnrolled && styles.programPillTextActive,
-                    isEnrolled && prog.type === 'grocery' && { color: '#15803D' },
-                    isEnrolled && prog.type === 'loyalty' && { color: '#B45309' },
-                  ]}>
-                    {isEnrolled ? `✓ ${prog.badgeLabel}` : `+ ${prog.badgeLabel}`}
-                    {dist ? ` (${dist})` : ''}
-                  </Text>
-                </TouchableOpacity>
-              );
-            })}
-
-            <TouchableOpacity
-              onPress={() => setShowAllPrograms(prev => !prev)}
-              style={styles.moreProgramsBtn}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.moreProgramsBtnText}>
-                {showAllPrograms ? 'Show fewer' : '+ More programs'}
-              </Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-
-        {/* ── Vehicle params ── */}
-        <View style={styles.chipsRow}>
-          <ParamChip label="MPG"      value={mpg}         onChangeText={setMpg} />
-          <ParamChip label="Gallons"  value={gallons}      onChangeText={setGallons} />
-          <ParamChip label="$/hr"     value={hourlyValue}  onChangeText={setHourlyValue} />
-        </View>
+          <Text style={styles.prefsBannerEdit}>Edit</Text>
+        </TouchableOpacity>
 
         {/* ── Search button ── */}
         <TouchableOpacity
@@ -1011,143 +882,44 @@ const styles = StyleSheet.create({
     marginLeft: 8,
   },
 
-  // Vehicle & Commute presets
-  presetsRow: {
+  headerActions: {
     flexDirection: 'row',
-    flexWrap: 'wrap',
+    alignItems: 'center',
     gap: 6,
-    marginBottom: 10,
   },
-  presetChip: {
-    paddingVertical: 5,
-    paddingHorizontal: 9,
-    borderRadius: 14,
+
+  // Quick Preferences Summary Bar
+  prefsBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
     backgroundColor: T.surface,
+    borderRadius: 10,
     borderWidth: 1,
     borderColor: T.border,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    marginBottom: 12,
   },
-  presetChipActive: {
-    backgroundColor: T.blueBg,
-    borderColor: T.blue,
+  prefsBannerLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    flex: 1,
+    marginRight: 8,
   },
-  presetChipText: {
-    fontSize: 11,
-    fontWeight: '500',
+  prefsGearIcon: {
+    marginRight: 8,
+  },
+  prefsBannerText: {
+    fontSize: 12,
     color: T.text2,
+    fontWeight: '500',
+    flex: 1,
   },
-  presetChipTextActive: {
+  prefsBannerEdit: {
+    fontSize: 12,
     color: T.blue,
     fontWeight: '700',
-  },
-  presetChipTimeActive: {
-    backgroundColor: T.goldBg,
-    borderColor: T.gold,
-  },
-  presetChipTimeTextActive: {
-    color: T.gold,
-    fontWeight: '700',
-  },
-
-  // Discounts & Memberships in Area
-  programsSection: {
-    marginBottom: 14,
-  },
-  programsHeaderRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: 6,
-  },
-  programsTitle: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: T.text2,
-    letterSpacing: 0.5,
-  },
-  programsSubtitle: {
-    fontSize: 11,
-    color: T.text3,
-    marginTop: 1,
-  },
-  programsList: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-  },
-  programPill: {
-    paddingVertical: 5,
-    paddingHorizontal: 9,
-    borderRadius: 12,
-    backgroundColor: T.surface,
-    borderWidth: 1,
-    borderColor: T.border,
-  },
-  programPillActive: {
-    backgroundColor: '#EFF6FF',
-    borderColor: '#93C5FD',
-  },
-  programPillActiveGrocery: {
-    backgroundColor: '#F0FDF4',
-    borderColor: '#86EFAC',
-  },
-  programPillActiveLoyalty: {
-    backgroundColor: '#FFFBEB',
-    borderColor: '#FDE68A',
-  },
-  programPillText: {
-    fontSize: 11,
-    fontWeight: '500',
-    color: T.text2,
-  },
-  programPillTextActive: {
-    color: '#1D4ED8',
-    fontWeight: '700',
-  },
-  moreProgramsBtn: {
-    paddingVertical: 5,
-    paddingHorizontal: 9,
-    borderRadius: 12,
-    backgroundColor: 'transparent',
-    borderWidth: 1,
-    borderStyle: 'dashed',
-    borderColor: T.border,
-    justifyContent: 'center',
-  },
-  moreProgramsBtnText: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: T.text3,
-  },
-
-  // Vehicle param chips
-  chipsRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginBottom: 14,
-  },
-  chip: {
-    flex: 1,
-    backgroundColor: T.surface,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: T.border,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    alignItems: 'center',
-  },
-  chipLabel: {
-    fontSize: 10,
-    fontWeight: '600',
-    color: T.text2,
-    letterSpacing: 0.5,
-    marginBottom: 3,
-  },
-  chipInput: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: T.text1,
-    textAlign: 'center',
-    width: '100%',
-    ...(Platform.OS === 'web' ? ({ outlineStyle: 'none' } as object) : {}),
   },
 
   // Search button

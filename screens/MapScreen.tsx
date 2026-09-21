@@ -49,12 +49,22 @@ if (Platform.OS === 'web') {
   MapViewComponent = require('../components/MapView.web').default;
 }
 
+import type { UserPreferences } from './SettingsScreen';
+
 interface MapScreenProps {
   onOpenCalculator: () => void;
+  onOpenSettings:   () => void;
+  onUpdatePreferences?: (prefs: UserPreferences) => void;
+  preferences?:     UserPreferences;
 }
 
 // ─── Component ────────────────────────────────────────────────────────────────
-export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
+export default function MapScreen({
+  onOpenCalculator,
+  onOpenSettings,
+  onUpdatePreferences,
+  preferences,
+}: MapScreenProps) {
   const { width } = useWindowDimensions();
   const isWide    = width >= 720;
 
@@ -375,6 +385,9 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
             selectedStation={selectedStation}
             stations={stations}
             onOpenCalculator={onOpenCalculator}
+            onOpenSettings={onOpenSettings}
+            onUpdatePreferences={onUpdatePreferences}
+            preferences={preferences}
             userLat={userLat}
             userLng={userLng}
             onOriginSelect={handleOriginSelect}
@@ -430,6 +443,9 @@ export default function MapScreen({ onOpenCalculator }: MapScreenProps) {
                 selectedStation={selectedStation}
                 stations={stations}
                 onOpenCalculator={onOpenCalculator}
+                onOpenSettings={onOpenSettings}
+                onUpdatePreferences={onUpdatePreferences}
+                preferences={preferences}
                 userLat={userLat}
                 userLng={userLng}
                 onOriginSelect={handleOriginSelect}

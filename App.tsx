@@ -11,6 +11,7 @@ import {
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import MapScreen from './screens/MapScreen';
+import SettingsScreen, { type UserPreferences, loadStoredPreferences, saveStoredPreferences } from './screens/SettingsScreen';
 
 // ─── Color Tokens (Clean, utilitarian Google/Linear-inspired light palette) ───
 const C = {
@@ -341,12 +342,39 @@ function CalculatorScreen({ onBack }: { onBack: () => void }) {
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [showCalculator, setShowCalculator] = useState(false);
+  const [currentScreen, setCurrentScreen] = useState<'map' | 'calculator' | 'settings'>('map');
+  const [userPreferences, setUserPreferences] = useState<UserPreferences>(() => loadStoredPreferences());
 
-  if (showCalculator) {
-    return <CalculatorScreen onBack={() => setShowCalculator(false)} />;
+  const handleUpdatePreferences = useCallback((updated: UserPreferences) => {
+    setUserPreferences(updated);
+    saveStoredPreferences(updated);
+  }, []);
+
+  if (currentScreen === 'calculator') {
+    return <CalculatorScreen onBack={() => setCurrentScreen('map')} />;
   }
-  return <MapScreen onOpenCalculator={() => setShowCalculator(true)} />;
+
+  if (currentScreen === 'settings') {
+    return (
+      <SettingsScreen
+        initialPreferences={userPreferences}
+        onSave={updated => {
+          handleUpdatePreferences(updated);
+          setCurrentScreen('map');
+        }}
+        onBack={() => setCurrentScreen('map')}
+      />
+    );
+  }
+
+  return (
+    <MapScreen
+      preferences={userPreferences}
+      onUpdatePreferences={handleUpdatePreferences}
+      onOpenCalculator={() => setCurrentScreen('calculator')}
+      onOpenSettings={() => setCurrentScreen('settings')}
+    />
+  );
 }
 
 // ─── Styles ───────────────────────────────────────────────────────────────────
